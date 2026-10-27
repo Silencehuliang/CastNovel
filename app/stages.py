@@ -1,9 +1,11 @@
-"""生成流水线编排:设定 → 角色 → 大纲 → 章纲 → 正文 → 润色 → 审校 → 修订 → 定稿(摘要+状态)。
+"""生成流水线编排:设定 → 角色 → 大纲 → 章纲 → 正文(含一致性门禁)→ 润色 → 审校 → 修订 → 定稿(摘要+状态)→ 批量连写。
 
 所有函数均为同步阻塞实现,由路由层包成 SSE 流;on_delta 用于流式回传文本。
-润色与修订只返回新稿、不落库,由前端确认后再保存(人为主编原则)。
+润色与修订只返回新稿、不落库,由前端确认后再保存(人为主编原则);
+采用时自动对原稿做版本快照,可随时回滚。
 """
 import json
+import re
 
 from app import db, prompts
 from app.config import load_settings, resolve_profile
@@ -22,6 +24,51 @@ def _chat(pid, stage, profile, messages, on_delta=None, json_mode=False):
     text = chat(profile, messages, json_mode=json_mode, on_delta=on_delta)
     db.add_usage(pid, stage, len(json.dumps(messages, ensure_ascii=False)), len(text))
     return text
+
+
+# ---------- 程序化一致性门禁(不依赖模型自觉,借鉴 wfcz10086/天命) ----------
+
+def _ngrams(text, n=8):
+    s = re.sub(r"\s+", "", text or "")
+    return {s[i:i + n] for i in range(max(0, len(s) - n + 1))} if len(s) >= n else set()
+
+
+def run_gate(settings, project, chapters, characters, chapter):
+    content = chapter.get("content") or ""
+    words = len(re.sub(r"\s", "", content))
+    target = int(settings.get("gen", {}).get("chapter_words", 3000))
+    issues = []
+    if not content.strip():
+        issues.append({"type": "字数", "level": "warn", "msg": "本章正文为空"})
+    elif words < target * 0.5:
+        issues.append({"type": "字数", "level": "warn", "msg": f"正文 {words} 字,不足目标 {target} 字的一半"})
+    elif words < target * 0.8:
+        issues.append({"type": "字数", "level": "info", "msg": f"正文 {words} 字,略低于目标 {target} 字"})
+
+    names = [c["name"] for c in (characters or []) if c.get("name")]
+    hits = [n for n in names if n in content]
+    if names and not hits:
+        issues.append({"type": "人物", "level": "warn", "msg": "全文未提及任何既有关键角色,疑似跑题或人名不一致"})
+
+    cur = _ngrams(content)
+    worst = 0.0
+    prevs = [ch for ch in (chapters or []) if ch["idx"] < chapter["idx"] and (ch.get("content") or "").strip()][-3:]
+    for ch in prevs:
+        other = _ngrams(ch["content"])
+        union = cur | other
+        if union:
+            worst = max(worst, len(cur & other) / len(union))
+    if worst > 0.12:
+        issues.append({"type": "重复", "level": "warn", "msg": f"与近三章的最大文本重复率约 {worst:.0%},疑似复述旧情节"})
+
+    return {
+        "words": words,
+        "target": target,
+        "char_hits": hits,
+        "char_missed": [n for n in names if n not in hits],
+        "overlap": round(worst, 3),
+        "issues": issues,
+    }
 
 
 def _ctx_parts(pid, target_idx, settings):
@@ -128,17 +175,32 @@ def gen_draft(pid, cid, on_delta=None):
     chapter = db.get_chapter(cid)
     if not chapter:
         raise ValueError("章节不存在")
-    project, _, _, context = _ctx_parts(pid, chapter["idx"], settings)
+    if (chapter.get("content") or "").strip():
+        db.add_version(cid, f"第{chapter['idx']}章重新生成前自动保存")
+    project, characters, chapters, context = _ctx_parts(pid, chapter["idx"], settings)
     words = int(settings.get("gen", {}).get("chapter_words", 3000))
     beats_text = chapter.get("beats") or ""
     beats = [ln.strip() for ln in beats_text.splitlines() if ln.strip() and not ln.strip().startswith("章末钩子")]
     messages = prompts.draft_messages(project, chapter, beats, context, words)
     db.update_chapter(cid, {"status": "drafting"})
     text = _chat(pid, "draft", resolve_profile(settings, "strong"), messages, on_delta=on_delta)
-    db.update_chapter(cid, {"content": text, "status": "draft"})
+    gate = run_gate(settings, project, chapters, characters, {**chapter, "content": text})
+    db.update_chapter(cid, {"content": text, "status": "draft", "gate": json.dumps(gate, ensure_ascii=False)})
     db.touch_project(pid)
     db.add_log(pid, "draft", f"第{chapter['idx']}章 {len(text)}字")
-    return text
+    return {**db.get_chapter(cid), "_gate": gate}
+
+
+def adopt_content(pid, cid, content, note=""):
+    """采用新稿(润色/修订/回滚确认):旧稿先做版本快照。"""
+    chapter = db.get_chapter(cid)
+    if not chapter:
+        raise ValueError("章节不存在")
+    if (chapter.get("content") or "").strip() and content != chapter["content"]:
+        db.add_version(cid, note or "采用新稿前自动保存")
+    db.update_chapter(cid, {"content": content})
+    db.touch_project(pid)
+    return db.get_chapter(cid)
 
 
 def polish_chapter(pid, cid, on_delta=None):
@@ -216,6 +278,10 @@ def finalize_chapter(pid, cid):
         if isinstance(f, dict) and f.get("title"):
             db.upsert_foreshadow(pid, f.get("title", ""), f.get("description", ""),
                                  f.get("action", "plant"), idx)
+    for pl in state.get("plotlines", []) or []:
+        if isinstance(pl, dict) and pl.get("title"):
+            db.upsert_plotline(pid, pl.get("title", ""), pl.get("description", ""),
+                               pl.get("action", "start"), idx)
     db.update_chapter(cid, {"status": "final"})
     db.touch_project(pid)
     db.add_log(pid, "finalize", f"第{idx}章 定稿,摘要 {len(summary_text)}字")
@@ -247,3 +313,62 @@ def import_text(pid, text):
     db.touch_project(pid)
     db.add_log(pid, "import", f"导入 {len(chapters)} 章")
     return len(chapters)
+
+
+def restore_version(pid, cid, vid):
+    """回滚到指定版本:当前稿先自动快照,再写回历史版本。"""
+    version = db.get_version(vid)
+    if not version or version["chapter_id"] != cid:
+        raise ValueError("版本不存在")
+    db.add_version(cid, "回滚前自动保存")
+    db.update_chapter(cid, {"content": version["content"] or "", "status": "draft"})
+    db.touch_project(pid)
+    return db.get_chapter(cid)
+
+
+def batch_generate(pid, count=3, review_each=False, on_event=None):
+    """批量连写:对尚未写作的章节依次执行 章纲 → 正文 →(可选审校)→ 定稿。
+
+    只处理 status=planned 且无正文的章节,绝不覆盖已有内容;
+    连续 2 章失败自动熔断,避免空烧 API。
+    """
+    def ev(data):
+        if on_event:
+            on_event(data)
+
+    settings = load_settings(db)
+    chapters = db.list_chapters(pid)
+    todo = [ch for ch in chapters
+            if ch["status"] == "planned" and not (ch.get("content") or "").strip()][:max(1, count)]
+    if not todo:
+        raise ValueError("没有待写的章节(均已定稿或有正文)。可在大纲页手动加章,或勾选覆盖重新生成大纲。")
+    done, fails = 0, 0
+    for ch in todo:
+        cid = ch["id"]
+        ev({"event": "chapter_start", "idx": ch["idx"], "title": ch["title"]})
+        try:
+            if len((ch.get("beats") or "").strip()) < 10:
+                gen_beats(pid, cid)
+            gen_draft(pid, cid)
+            if review_each:
+                review_chapter(pid, cid)
+            finalize_chapter(pid, cid)
+            done += 1
+            fails = 0
+            fresh = db.get_chapter(cid)
+            gate = {}
+            try:
+                gate = json.loads(fresh.get("gate") or "{}")
+            except Exception:
+                pass
+            ev({"event": "chapter_done", "idx": ch["idx"], "cid": cid,
+                "chars": len(fresh.get("content") or ""),
+                "gate_issues": [i for i in gate.get("issues", []) if i.get("level") == "warn"]})
+        except Exception as e:
+            fails += 1
+            ev({"event": "chapter_error", "idx": ch["idx"], "message": str(e)})
+            if fails >= 2:
+                ev({"event": "aborted", "done": done, "message": "连续 2 章失败,批量任务中止(避免空烧 API)"})
+                break
+    ev({"event": "batch_done", "done": done, "total": len(todo)})
+    return {"done": done, "total": len(todo)}

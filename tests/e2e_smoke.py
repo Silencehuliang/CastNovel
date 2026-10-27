@@ -78,6 +78,10 @@ assert ch and "节拍" not in ch["beats"] and len(ch["beats"]) > 30, ch
 _, ch = step("生成第1章正文", lambda: req("POST", f"/api/projects/{pid}/chapters/{cid}/draft"))
 assert ch and len(ch["content"]) > 500, f"正文过短 {len(ch.get('content',''))}"
 step("正文字数", lambda: len(ch["content"]))
+assert ch.get("gate"), "门禁报告缺失"
+gate = json.loads(ch["gate"]) if isinstance(ch["gate"], str) else ch["gate"]
+assert gate["words"] > 0
+step("门禁检查", lambda: f"{gate['words']}/{gate['target']}字, 人物命中{len(gate['char_hits'])}")
 
 ctx = step("上下文预览", lambda: req("GET", f"/api/projects/{pid}/chapters/{cid}/context"))
 assert "世界观" in ctx["context"] or "写作要求" in ctx["context"]
@@ -104,8 +108,34 @@ c1 = b4["chapters"][1]["id"]
 ctx2 = step("第2章上下文(含前情)", lambda: req("GET", f"/api/projects/{pid}/chapters/{c1}/context"))
 assert "第1章" in ctx2["context"], "前情脉络缺失"
 
+# 批量连写第 2、3 章
+_, bat = step("批量连写2章", lambda: req("POST", f"/api/projects/{pid}/batch", {"count": 2, "review_each": False}))
+assert bat and bat["done"] == 2, bat
+b5 = req("GET", f"/api/projects/{pid}")
+finals = [c for c in b5["chapters"] if c["status"] == "final"]
+assert len(finals) == 3, f"定稿章数异常 {len(finals)}"
+assert any((c.get("gate") or "") for c in b5["chapters"]), "批量章节门禁报告缺失"
+step("批量后定稿章数", lambda: len(finals))
+
+# 情节线(定稿时应由状态抽取写入)
+assert len(b5.get("plotlines", [])) >= 1, "情节线缺失"
+step("情节线条数", lambda: len(b5["plotlines"]))
+
+# 版本:采用新稿 → 自动快照 → 回滚
+c2 = next(c for c in b5["chapters"] if c["idx"] == 2)
+orig_len = len(c2["content"] or "")
+step("采用新稿(自动快照)", lambda: req("POST", f"/api/projects/{pid}/chapters/{c2['id']}/adopt",
+                                      {"content": "回滚测试用新稿。" * 50, "note": "e2e 测试"}))
+vers = step("版本列表", lambda: req("GET", f"/api/projects/{pid}/chapters/{c2['id']}/versions"))
+assert len(vers) >= 1
+step("回滚", lambda: req("POST", f"/api/projects/{pid}/chapters/{c2['id']}/versions/{vers[0]['id']}/restore"))
+b6 = req("GET", f"/api/projects/{pid}")
+c2b = next(c for c in b6["chapters"] if c["idx"] == 2)
+assert len(c2b["content"] or "") == orig_len, "回滚后内容与快照不一致"
+step("回滚校验", lambda: f"恢复 {len(c2b['content'])} 字")
+
 usage = step("用量统计", lambda: req("GET", f"/api/projects/{pid}/usage"))
-assert usage["calls"] >= 8
+assert usage["calls"] >= 12
 
 # 导出
 with urllib.request.urlopen(f"{BASE}/api/projects/{pid}/export?format=txt") as resp:
@@ -116,6 +146,10 @@ with urllib.request.urlopen(f"{BASE}/api/projects/{pid}/export?format=md") as re
     md = resp.read().decode("utf-8")
 assert "# 长夜行者" in md
 step("导出 Markdown", lambda: f"{len(md)} 字符")
+with urllib.request.urlopen(f"{BASE}/api/projects/{pid}/export?format=epub") as resp:
+    epub = resp.read()
+assert epub[:2] == b"PK" and len(epub) > 1000, "EPUB 结构异常"
+step("导出 EPUB", lambda: f"{len(epub)} 字节")
 
 # 导入拆书(覆盖)
 sample = "第一章 起点\n\n夜色如墨。他推开门。\n\n第二章 转折\n\n雨落下来。玉佩发烫。\n\n第三章 出发\n\n天亮了,他背起行囊。"

@@ -73,6 +73,7 @@ async function sse(path, body, h) {
         if (!line.startsWith("data:")) continue;
         const evt = JSON.parse(line.slice(5).trim());
         if (evt.type === "delta") h.onDelta && h.onDelta(evt.text);
+        else if (evt.type === "progress") h.onEvent && h.onEvent(evt.data);
         else if (evt.type === "done") return evt.result;
         else if (evt.type === "error") throw new Error(evt.message);
       }
@@ -235,6 +236,8 @@ function renderSetting(view) {
       <textarea id="f-premise" rows="2">${esc(p.premise)}</textarea>
       <label class="fld">文风</label>
       <textarea id="f-style" rows="2">${esc(p.style)}</textarea>
+      <label class="fld">文风样本(可选:粘贴一段你最想模仿的正文,AI 将模仿其节奏与用词)</label>
+      <textarea id="f-styleref" rows="3" placeholder="(可留空)粘贴 300~900 字样章……">${esc(p.style_ref || "")}</textarea>
       <div class="row" style="margin-top:8px;">
         <span class="chip" data-style="节奏明快,冲突密集,画面感强,对话简洁有锋,金句点睛">爽文快节奏</span>
         <span class="chip" data-style="细腻沉稳,注重心理与氛围,意象化表达,节奏舒缓">细腻文艺</span>
@@ -287,10 +290,39 @@ function renderSetting(view) {
         </tbody>
       </table>
     </div>
+
+    <div class="card">
+      <h3>情节线 <span class="hint">定稿章节时由 AI 自动登记推进,支撑多线叙事不散架</span></h3>
+      <table class="tbl">
+        <thead><tr><th>情节线</th><th>当前进展</th><th style="width:80px">状态</th><th style="width:70px">开启</th><th style="width:70px">最近</th><th style="width:56px"></th></tr></thead>
+        <tbody>
+          ${(state.bundle.plotlines || []).map(pl => `
+            <tr>
+              <td>${esc(pl.title)}</td>
+              <td style="color:var(--ink-soft)">${esc(pl.description)}</td>
+              <td><span class="badge ${pl.status === "active" ? "b-open" : "b-resolved"}" data-plstatus="${pl.id}" style="cursor:pointer">${pl.status === "active" ? "进行中" : "已完结"}</span></td>
+              <td>${pl.start_ch ?? "—"}</td>
+              <td>${pl.last_ch ?? "—"}</td>
+              <td><button class="btn btn-sm btn-danger" data-pldel="${pl.id}">删除</button></td>
+            </tr>`).join("") || `<tr><td colspan="6" style="color:var(--ink-soft)">暂无情节线,定稿章节后自动生成</td></tr>`}
+        </tbody>
+      </table>
+    </div>
   `;
 
   $("#btnSaveInfo").onclick = saveProjectInfo;
   $$(".chip").forEach(ch => ch.onclick = () => { $("#f-style").value = ch.dataset.style; markDirty(); });
+  $$("[data-plstatus]").forEach(el => el.onclick = async () => {
+    const plid = el.dataset.plstatus;
+    const cur = el.textContent === "进行中" ? "done" : "active";
+    await api(`/projects/${state.pid}/plotlines/${plid}`, { method: "PUT", body: JSON.stringify({ status: cur }) });
+    await loadProject(); renderSetting(view);
+  });
+  $$("[data-pldel]").forEach(el => el.onclick = async () => {
+    if (!confirm("删除这条情节线?")) return;
+    await api(`/projects/${state.pid}/plotlines/${el.dataset.pldel}`, { method: "DELETE" });
+    await loadProject(); renderSetting(view);
+  });
   $("#btnGenWv").onclick = async () => {
     await saveProjectInfo(true);
     const box = $("#wv-stream"); box.style.display = "block"; box.textContent = "";
@@ -380,6 +412,7 @@ async function saveProjectInfo(silent) {
     premise: $("#f-premise").value.trim(),
     style: $("#f-style").value.trim(),
     worldview: $("#f-worldview") ? $("#f-worldview").value : p.worldview,
+    style_ref: $("#f-styleref") ? $("#f-styleref").value : (p.style_ref || ""),
   };
   await api(`/projects/${state.pid}`, { method: "PUT", body: JSON.stringify(body) });
   await loadProject();
@@ -521,6 +554,15 @@ function chapterOptions() {
     `<option value="${c.id}" ${c.id === state.cid ? "selected" : ""}>第${c.idx}章 ${esc(c.title)} [${STATUS_TXT[c.status] || ""}]</option>`).join("");
 }
 
+function gateBadges(ch) {
+  const g = ch && ch.gate ? safeJSON(ch.gate) : null;
+  if (!g) return "";
+  const issues = g.issues || [];
+  const warn = issues.filter(i => i.level === "warn").length;
+  const tip = issues.map(i => i.msg).join("\n") || "门禁检查通过";
+  return `<span class="badge ${warn ? "b-中" : "b-resolved"}" title="${esc(tip)}">门禁:${g.words}/${g.target}字 · 人物${(g.char_hits || []).length}个${warn ? ` · ⚠${warn}` : " · ✓"}</span>`;
+}
+
 function renderWrite(view) {
   const ch = curChapter();
   view.innerHTML = `
@@ -529,11 +571,21 @@ function renderWrite(view) {
         <select id="wsel" style="max-width:340px">${chapterOptions()}</select>
         <span id="w-status">${ch ? statusBadge(ch.status) : ""}</span>
         <span id="w-count" style="font-size:12px;color:var(--ink-soft)">${ch ? (ch.content || "").length + " 字" : ""}</span>
+        <span id="w-gate">${ch ? gateBadges(ch) : ""}</span>
         <span style="flex:1"></span>
         <button class="btn btn-sm" id="btnPrev" ${ch && curChapters().indexOf(ch) > 0 ? "" : "disabled"}>← 上一章</button>
         <button class="btn btn-sm" id="btnNext" ${ch && curChapters().indexOf(ch) < curChapters().length - 1 ? "" : "disabled"}>下一章 →</button>
       </div>
       ${ch ? `
+      <div class="row" style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--line);">
+        <input type="number" id="batch-count" value="3" min="1" max="50" style="width:76px" title="连续写作章数">
+        <label style="font-size:12.5px"><input type="checkbox" id="batch-review"> 每章审校</label>
+        <button class="btn btn-sm" data-lock id="btnBatch" title="对未写章节依次:章纲→正文(→审校)→定稿">⚡ 批量连写</button>
+        <span style="flex:1"></span>
+        <button class="btn btn-sm" id="btnVersions">🕘 版本历史</button>
+        <button class="btn btn-sm" id="btnSnapshot">保存快照</button>
+      </div>
+      <div class="statusline" id="batch-log"></div>
       <details class="ctx">
         <summary>查看本章将注入的上下文(前情 / 角色状态 / 相关旧情节 / 伏笔)</summary>
         <pre id="ctx-pre">点击 summary 展开时自动加载…</pre>
@@ -611,6 +663,67 @@ function renderWrite(view) {
     await loadProject(); state.dirty = false; toast("正文已保存");
     renderWrite(view);
   };
+  $("#btnBatch").onclick = runBatch;
+  $("#btnVersions").onclick = () => openVersions(view);
+  $("#btnSnapshot").onclick = async () => {
+    const note = prompt("版本备注:", "手动快照");
+    if (note === null) return;
+    await api(`/projects/${state.pid}/chapters/${state.cid}/versions`, {
+      method: "POST", body: JSON.stringify({ note: note || "手动快照" }),
+    });
+    toast("已保存快照");
+  };
+}
+
+/* 批量连写:章纲 → 正文 →(可选审校)→ 定稿,事件流实时显示 */
+async function runBatch() {
+  const count = parseInt($("#batch-count").value, 10) || 3;
+  const review = $("#batch-review").checked;
+  if (!confirm(`将连续写作 ${count} 章(章纲 → 正文${review ? " → 审校" : ""} → 定稿),消耗较多 API 额度,确定开始?`)) return;
+  const log = $("#batch-log");
+  log.textContent = "批量任务启动…";
+  try {
+    const r = await sse(`/projects/${state.pid}/batch`, { count, review_each: review }, {
+      onEvent: e => {
+        let line = "";
+        if (e.event === "chapter_start") line = `[第${e.idx}章 ${e.title}] 开始…`;
+        else if (e.event === "chapter_done") line = `[第${e.idx}章] 完成 ${e.chars} 字` + ((e.gate_issues || []).length ? ` ⚠${e.gate_issues.length} 项门禁警告` : " ✓ 门禁通过");
+        else if (e.event === "chapter_error") line = `[第${e.idx}章] 失败:${e.message}`;
+        else if (e.event === "aborted") line = `⛔ ${e.message}`;
+        else if (e.event === "batch_done") line = `批量结束:${e.done}/${e.total} 章完成`;
+        if (line) log.textContent = (log.textContent + "\n" + line).split("\n").slice(-14).join("\n");
+      },
+    });
+    toast(`批量连写完成:${(r && r.done) || 0} 章`);
+  } catch (e) { toast(e.message, true); }
+  await loadProject();
+  switchTab("write");
+}
+
+/* 版本历史:查看/恢复快照 */
+async function openVersions(view) {
+  openModal("章节版本历史", `<div id="ver-list">加载中…</div>`, close => close(), "关闭");
+  const rows = await api(`/projects/${state.pid}/chapters/${state.cid}/versions`);
+  const box = $("#ver-list");
+  if (!box) return;
+  box.innerHTML = rows.length ? `
+    <table class="tbl">
+      <thead><tr><th>时间</th><th>备注</th><th>字数</th><th></th></tr></thead>
+      <tbody>${rows.map(v => `
+        <tr><td>${esc(v.created_at)}</td><td>${esc(v.note)}</td><td>${v.chars}</td>
+        <td><button class="btn btn-sm" data-vrestore="${v.id}">恢复此版本</button></td></tr>`).join("")}
+      </tbody>
+    </table>`
+    : `<p style="color:var(--ink-soft)">还没有版本记录。重新生成/采用新稿前会自动快照,也可手动「保存快照」。</p>`;
+  $$("[data-vrestore]", box).forEach(b => b.onclick = async () => {
+    if (!confirm("恢复该版本?当前稿会先自动快照,不会丢失。")) return;
+    await api(`/projects/${state.pid}/chapters/${state.cid}/versions/${b.dataset.vrestore}/restore`, { method: "POST", body: "{}" });
+    closeModal();
+    await loadProject();
+    state.dirty = false;
+    toast("已回滚到历史版本");
+    renderWrite(view);
+  });
 }
 
 async function navChapter(delta, view) {
@@ -729,11 +842,11 @@ async function previewOverwrite(url, streamSel, title, view, areaSel) {
     return;
   }
   $("#pv-adopt").onclick = async () => {
-    await api(`/projects/${state.pid}/chapters/${state.cid}`, {
-      method: "PUT", body: JSON.stringify({ content: pv.value }),
+    await api(`/projects/${state.pid}/chapters/${state.cid}/adopt`, {
+      method: "POST", body: JSON.stringify({ content: pv.value, note: title }),
     });
     state.dirty = false;
-    toast("已采用新稿");
+    toast("已采用新稿(原稿已自动快照,可在版本历史找回)");
     await loadProject();
     switchTab(state.tab);
   };
@@ -765,6 +878,7 @@ async function renderExport(view) {
         <button class="btn" id="exp-txt">导出 TXT</button>
         <button class="btn" id="exp-md">导出 Markdown</button>
         <button class="btn" id="exp-docx">导出 DOCX</button>
+        <button class="btn" id="exp-epub">导出 EPUB</button>
       </div>
     </div>
     <div class="card">
@@ -779,6 +893,7 @@ async function renderExport(view) {
   $("#exp-txt").onclick = () => window.open(`/api/projects/${state.pid}/export?format=txt`);
   $("#exp-md").onclick = () => window.open(`/api/projects/${state.pid}/export?format=md`);
   $("#exp-docx").onclick = () => window.open(`/api/projects/${state.pid}/export?format=docx`);
+  $("#exp-epub").onclick = () => window.open(`/api/projects/${state.pid}/export?format=epub`);
   $("#btnImport").onclick = async () => {
     const f = $("#imp-file").files[0];
     if (!f) { toast("请先选择 txt/md 文件", true); return; }

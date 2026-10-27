@@ -30,6 +30,17 @@ class ProjectPatch(BaseModel):
     premise: str | None = None
     style: str | None = None
     worldview: str | None = None
+    style_ref: str | None = None
+
+
+class BatchIn(BaseModel):
+    count: int = 3
+    review_each: bool = False
+
+
+class AdoptIn(BaseModel):
+    content: str
+    note: str = ""
 
 
 class OutlineIn(BaseModel):
@@ -99,6 +110,7 @@ def _bundle(pid, with_content=True):
         "characters": db.list_characters(pid),
         "chapters": db.list_chapters(pid, with_content=with_content),
         "foreshadowing": db.list_foreshadowing(pid),
+        "plotlines": db.list_plotlines(pid),
     }
 
 
@@ -298,6 +310,96 @@ def delete_chapter(pid: int, cid: int):
     return {"ok": True}
 
 
+@router.post("/projects/{pid}/chapters/{cid}/adopt")
+def adopt_content(pid: int, cid: int, payload: AdoptIn):
+    try:
+        return stages.adopt_content(pid, cid, payload.content, payload.note)
+    except Exception as e:
+        _err(e)
+
+
+# ---------- 章节版本 ----------
+
+@router.get("/projects/{pid}/chapters/{cid}/versions")
+def list_versions(pid: int, cid: int):
+    return db.list_versions(cid)
+
+
+@router.post("/projects/{pid}/chapters/{cid}/versions")
+def create_version(pid: int, cid: int, payload: dict):
+    note = (payload or {}).get("note", "")
+    db.add_version(cid, note)
+    return db.list_versions(cid)
+
+
+@router.get("/projects/{pid}/chapters/{cid}/versions/{vid}")
+def get_version(pid: int, cid: int, vid: int):
+    v = db.get_version(vid)
+    if not v or v["chapter_id"] != cid:
+        raise HTTPException(status_code=404, detail="版本不存在")
+    return v
+
+
+@router.post("/projects/{pid}/chapters/{cid}/versions/{vid}/restore")
+def restore_version(pid: int, cid: int, vid: int):
+    try:
+        return stages.restore_version(pid, cid, vid)
+    except Exception as e:
+        _err(e)
+
+
+# ---------- 批量连写 ----------
+
+@router.post("/projects/{pid}/batch")
+def batch(pid: int, payload: BatchIn):
+    def gen():
+        q: queue.Queue = queue.Queue()
+
+        def worker():
+            try:
+                result = stages.batch_generate(
+                    pid, payload.count, payload.review_each,
+                    on_event=lambda e: q.put(("ev", e)))
+                q.put(("done", result))
+            except Exception as e:
+                q.put(("error", str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+        while True:
+            kind, data = q.get()
+            if kind == "ev":
+                yield f"data: {json.dumps({'type': 'progress', 'data': data}, ensure_ascii=False)}\n\n"
+            elif kind == "done":
+                yield f"data: {json.dumps({'type': 'done', 'result': data}, ensure_ascii=False)}\n\n"
+                break
+            else:
+                yield f"data: {json.dumps({'type': 'error', 'message': str(data)}, ensure_ascii=False)}\n\n"
+                break
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ---------- 情节线 ----------
+
+@router.put("/projects/{pid}/plotlines/{plid}")
+def patch_plotline(pid: int, plid: int, payload: dict):
+    allowed = {k: payload[k] for k in ("title", "description", "status") if k in payload}
+    if allowed:
+        sets = ", ".join(f"{k}=?" for k in allowed)
+        db.run(f"UPDATE plotlines SET {sets} WHERE id=? AND project_id=?", (*allowed.values(), plid, pid))
+    return {"ok": True}
+
+
+@router.delete("/projects/{pid}/plotlines/{plid}")
+def remove_plotline(pid: int, plid: int):
+    db.delete_plotline(plid)
+    return {"ok": True}
+
+
 class ImportIn(BaseModel):
     text: str
 
@@ -367,6 +469,9 @@ def do_export(pid: int, format: str = "md"):
 
     if format == "docx":
         data, name, media = export.export_docx(project, chapters)
+        return Response(content=data, media_type=media, headers=_headers(name))
+    if format == "epub":
+        data, name, media = export.export_epub(project, chapters)
         return Response(content=data, media_type=media, headers=_headers(name))
     text, name, media = export.export_text(project, chapters, fmt=format)
     return Response(content=text.encode("utf-8"), media_type=media, headers=_headers(name))

@@ -124,6 +124,9 @@ _MOCK_STATE = {
     "foreshadowing": [
         {"title": "夜里发烫的玉佩", "description": "(模拟)玉佩在雷雨夜隐隐发烫,指向身世之谜", "action": "plant"},
     ],
+    "plotlines": [
+        {"title": "身世之谜线", "description": "(模拟)玉佩线索推进,指向旧宅", "action": "advance"},
+    ],
 }
 
 

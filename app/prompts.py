@@ -88,9 +88,15 @@ def beats_messages(project, chapter, context, total):
 
 def draft_messages(project, chapter, beats, context, words):
     beats_txt = "\n".join(f"{i+1}. {b}" for i, b in enumerate(beats)) if beats else "(无,按概要自由发挥)"
+    style_ref = (project.get("style_ref") or "").strip()
+    style_block = f"""
+
+【文风样章(只模仿其叙述节奏、句式与用词密度,严禁抄袭其内容与人名)】
+{style_ref[:900]}""" if style_ref else ""
     user = f"""请撰写第 {chapter['idx']} 章《{chapter.get('title', '')}》正文。
 
 {context}
+{style_block}
 
 【本章概要】{chapter.get('summary') or '(暂无)'}
 
@@ -181,12 +187,14 @@ def summary_messages(project, chapter, prev_summaries, content):
 def state_extract_messages(project, chapter, content, known_chars, open_fores):
     user = f"""阅读第 {chapter['idx']} 章《{chapter.get('title', '')}》正文,抽取叙事状态变化,输出 JSON:
 {{"characters": [{{"name": "人物名(必须是已知人物或新出场人物)", "role": "主角/配角/反派/新角色 等", "profile": "仅新角色填写:60字内介绍;已知人物填空字符串", "status": "本章后的最新状态:伤势/修为/位置/关系变化等,30字内"}}],
-"foreshadowing": [{{"title": "伏笔名(10字内)", "description": "伏笔内容,40字内", "action": "plant 或 resolve"}}]}}
+"foreshadowing": [{{"title": "伏笔名(10字内)", "description": "伏笔内容,40字内", "action": "plant 或 resolve"}}],
+"plotlines": [{{"title": "情节线名(10字内,如:复仇线/感情线/寻宝线)", "description": "该线当前进展,40字内", "action": "start、advance 或 end"}}]}}
 
 规则:
 1. characters 只列本章有实质状态变化或新出场的人物;已知人物:{known_chars};
 2. foreshadowing:本章埋下新的钩子/悬念 → action=plant;本章回收了已有伏笔 → action=resolve(title 需与已有伏笔名一致,已有:{open_fores});
-3. 若无变化,对应数组为空。
+3. plotlines:本章开启新故事线 → start;既有故事线有推进 → advance;故事线终结 → end;
+4. 若无变化,对应数组为空。
 
 【正文】
 {content[:8000]}"""

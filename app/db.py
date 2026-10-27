@@ -71,7 +71,30 @@ CREATE TABLE IF NOT EXISTS logs(
   detail TEXT,
   created_at TEXT DEFAULT (datetime('now','localtime'))
 );
+CREATE TABLE IF NOT EXISTS chapter_versions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chapter_id INTEGER NOT NULL,
+  content TEXT,
+  note TEXT DEFAULT '',
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE TABLE IF NOT EXISTS plotlines(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  status TEXT DEFAULT 'active',
+  start_ch INTEGER,
+  last_ch INTEGER,
+  UNIQUE(project_id, title)
+);
 """
+
+# 运行时增量迁移:旧库缺列时补齐
+_MIGRATE_COLUMNS = [
+    ("projects", "style_ref", "TEXT DEFAULT ''"),
+    ("chapters", "gate", "TEXT DEFAULT ''"),
+]
 
 
 def init():
@@ -82,6 +105,10 @@ def init():
     _conn.row_factory = sqlite3.Row
     _conn.execute("PRAGMA journal_mode=WAL")
     _conn.executescript(SCHEMA)
+    for table, col, ddl in _MIGRATE_COLUMNS:
+        cols = {r["name"] for r in _conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if col not in cols:
+            _conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
     _conn.commit()
 
 
@@ -135,7 +162,7 @@ def touch_project(pid):
 
 
 def update_project(pid, fields: dict):
-    allowed = ["title", "genre", "premise", "style", "worldview", "volumes", "extra"]
+    allowed = ["title", "genre", "premise", "style", "worldview", "volumes", "extra", "style_ref"]
     sets, params = [], []
     for k in allowed:
         if k in fields:
@@ -209,7 +236,7 @@ def get_chapter(cid):
 
 
 def update_chapter(cid, fields: dict):
-    allowed = ["idx", "title", "beats", "summary", "content", "status", "review"]
+    allowed = ["idx", "title", "beats", "summary", "content", "status", "review", "gate"]
     sets, params = [], []
     for k in allowed:
         if k in fields:
@@ -281,6 +308,61 @@ def delete_foreshadow(fid):
 
 def add_log(pid, stage, detail=""):
     run("INSERT INTO logs(project_id,stage,detail) VALUES(?,?,?)", (pid, stage, detail[:4000]))
+
+
+# ---------- 章节版本 ----------
+
+def add_version(cid, note=""):
+    ch = get_chapter(cid)
+    if not ch:
+        return None
+    return run(
+        "INSERT INTO chapter_versions(chapter_id,content,note) VALUES(?,?,?)",
+        (cid, ch["content"] or "", note),
+    )
+
+
+def list_versions(cid):
+    return q(
+        "SELECT id, chapter_id, note, created_at, LENGTH(content) AS chars "
+        "FROM chapter_versions WHERE chapter_id=? ORDER BY id DESC",
+        (cid,),
+    )
+
+
+def get_version(vid):
+    return one("SELECT * FROM chapter_versions WHERE id=?", (vid,))
+
+
+# ---------- 情节线 ----------
+
+def list_plotlines(pid):
+    return q("SELECT * FROM plotlines WHERE project_id=? ORDER BY id", (pid,))
+
+
+def upsert_plotline(pid, title, description="", action="start", chapter_idx=None):
+    title = (title or "").strip()
+    if not title:
+        return
+    row = one("SELECT * FROM plotlines WHERE project_id=? AND title=?", (pid, title))
+    if row is None:
+        if action in ("start", "advance"):
+            run(
+                "INSERT INTO plotlines(project_id,title,description,start_ch,last_ch,status) "
+                "VALUES(?,?,?,?,?,?)",
+                (pid, title, description, chapter_idx, chapter_idx, "active"),
+            )
+        return
+    if action == "end":
+        run("UPDATE plotlines SET last_ch=?, status='done' WHERE id=?", (chapter_idx, row["id"]))
+    else:
+        run("UPDATE plotlines SET last_ch=? WHERE id=?", (chapter_idx, row["id"]))
+        if description and not row["description"]:
+            run("UPDATE plotlines SET description=? WHERE id=?", (description, row["id"]))
+
+
+def delete_plotline(plid):
+    run("DELETE FROM plotlines WHERE id=?", (plid,))
 
 
 def add_usage(pid, stage, prompt_chars, completion_chars):
