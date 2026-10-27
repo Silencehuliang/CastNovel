@@ -464,7 +464,7 @@ def do_export(pid: int, format: str = "md"):
 
     def _headers(name):
         return {
-            "Content-Disposition": f"attachment; filename=novelforge-export.{name.rsplit('.', 1)[-1]}; filename*=UTF-8''{quote(name)}"
+            "Content-Disposition": f"attachment; filename=castnovel-export.{name.rsplit('.', 1)[-1]}; filename*=UTF-8''{quote(name)}"
         }
 
     if format == "docx":

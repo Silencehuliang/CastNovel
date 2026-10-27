@@ -190,6 +190,57 @@
 
 来源:上述 arXiv 链接;汇总清单 [Awesome-Story-Generation](https://github.com/yingpengma/Awesome-Story-Generation)。
 
+---
+
+# 第四轮调研(2026-10-28 补充):英文与相邻生态
+
+> 覆盖 Google 研究工具、RP/互动叙事生态的记忆机制、传统编辑器、以及 2026 英文新浪潮。
+> ⚠️ 命名冲突预警:调研发现 [RhythmicWave/NovelForge](https://github.com/RhythmicWave/NovelForge)(1,263★,卡片式工作室)已存在,
+> 本项目因此由 NovelForge 更名为 **CastNovel(铸书)**。
+
+## 十一、记忆机制的黄金标准:Lorebook / World Info 三家对照
+
+| 维度 | SillyTavern(35.0k★) | NovelAI(闭源,规范公开) | KoboldAI(4.0k★/12.1k★) |
+|---|---|---|---|
+| 触发 | 主键+次键(AND/NOT ANY/ALL)、正则键、扫描深度 | 键+`&`窗口内 AND、正则、Always On | key + keysecondary + selective |
+| 注入位置 | 字符定义前后、@Depth+角色、宏插槽 | 有符号整数位 + **键相对插入**(紧邻触发词) | Memory/Author's Note 之后 |
+| 预算 | 上下文百分比/绝对值,耗尽即停;常驻优先 | 每条目预算 + **预留 token** | 有上限 |
+| 递归 | 条目可触发条目,最大递归步数 | 级联激活 | — |
+| 时效 | **Sticky/Cooldown/Delay**(按消息数,分支继承) | 条件激活(关键词/模型/概率/比较) | — |
+| 生态 | 大量现成 worldbook + MemoryBooks/DeepLore 扩展 | `.lorebook`/PNG 内嵌可携带 | 六字段 JSON 是通用交换格式 |
+
+**对 CastNovel 的意义**:v0.3 的关键词触发注入不必须从零设计——吸收六字段核心(key/content/constant/次键/顺序/预算),
+导入导出兼容 SillyTavern JSON,即可直接复用生态里数千份现成 worldbook。
+
+## 十二、其他英文项目
+
+- **Google Wordcraft**(351★):可扩展「操作+上下文」架构——**风格是可替换的数据包(few-shot 例集),不是代码**;操作是类型化注册表(头脑风暴/改写/模仿)而非自由聊天。
+- **ink**(4,990★)/ Twine(2,929★):叙事结构即数据(knots/choices);poltergink 的「AI 只能在作者写好的选项里选择」是分支章节的可借鉴模式;Twine 的 AI 生态是空白。
+- **Obsidian longform**(964★):场景即文件、手稿视图为派生物——本地纯文本所有权模型的先例。
+- **传统编辑器 AI 真空**:novelWriter(3.2k★)**明文反 AI**(禁止 AI 生成贡献)、Manuskript(2.5k★)、starc(403★)均无 AI——验证了独立本地 AI 工作台的定位,而非给老编辑器做插件。
+
+## 十三、2026 英文/中文新浪潮补充(第一轮未覆盖)
+
+| 项目 | star | 亮点 |
+|---|---|---|
+| ExplosiveCoderflome/AI-Novel-Writing-Assistant | 3,305 | LangGraph+Qdrant 自动导演;**每章 token 预算,任务中可存续**;短篇独立流水线 |
+| syrizelink/OpenFic | 1,250 | "Vibe Writing" 全能型,活跃 |
+| Nigh/show-me-the-story | 631 | **单文件 <5MB Go 二进制**;事实带出处引用;设定变更走**提案-批准**;崩溃回滚日志 |
+| ydsgangge-ux/dramatica-flow | 191 | Dramatica 因果链强制注入;伏笔生命周期(埋设→跟踪→**逾期告警**→回收);**人物信息边界**(只知道亲眼所见);三层审计 |
+| Xiaoyangy/novel-studio | 149 | **重要角色作为稳定 Agent** 带私有观察记忆;**World Arbiter**(结果由系统裁决,角色不能越权);全链路 SHA-256 锚定与检查点恢复 |
+| heider-x/vela | 584 | IDE 式,本地 LLM+RAG,隐私优先 |
+
+## 十四、第四轮对 CastNovel 的输入(并入 design.md)
+
+1. **Lorebook 兼容引擎**(v0.3 设计已细化):六字段核心 + 预算/顺序/常驻优先 + ST JSON 导入导出;
+2. **章节提交链 + 分支**(webnovel-writer + ST 分支继承):v1.0 事实账本的演进形态——从任意定稿分叉时间线,并行再生对比,择一合回正典;
+3. **信息边界过滤**(dramatica-flow/novel-studio):上下文编译时按 POV 角色知识过滤设定与事实——与「读者认知」同属视角状态;
+4. **World Arbiter 导演模式**(novel-studio):结果由系统状态机裁决,正文生成只能"提案";
+5. **阶段绑定技能包**(Pagekin SKILL.md):用户可将社区提示词包绑定到流水线特定阶段;
+6. **风格即数据包**(Wordcraft):few-shot 例集外置为可编辑资产,泛化本项目的文风样本。
+
+来源:GitHub API(2026-10-27 实查)及各仓库 README/官方文档,链接见正文。
+
 ## 来源
 
 - https://github.com/YILING0013/AI_NovelGenerator

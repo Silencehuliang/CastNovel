@@ -1,8 +1,9 @@
-# NovelForge(铸书)总体设计
+# CastNovel(铸书)总体设计
 
 > 版本:v0.2 · 更新:2026-10-28
-> 本文是项目的唯一权威设计文档,基于两轮开源生态调研([research.md](research.md),25+ 项目 + 学术系统)提炼。
+> 本文是项目的唯一权威设计文档,基于四轮开源生态调研([research.md](research.md),40+ 项目/系统 + 2024-2026 学术前沿)提炼。
 > 每个设计决策都标注了来源与理由;未实现的部分明确标注阶段。
+> 命名说明:初名 NovelForge,因 GitHub 已有同名项目(RhythmicWave/NovelForge)更名 **CastNovel**(cast:铸造,亦指「角色阵容」)。
 
 ## 1. 定位与用户画像
 
@@ -25,11 +26,11 @@
 
 ## 3. 生态输入:架构地图与功能矩阵
 
-两轮调研发现,2026 年的 AI 小说工具收敛为三种架构家族:
+四轮调研发现,2026 年的 AI 小说工具收敛为三种架构家族:
 
 | 家族 | 代表 | 一致性手段 | 借鉴 |
 |---|---|---|---|
-| **应用流水线** | 书童、AI_NovelGenerator、NovelForge | 上下文注入 + 状态回写 + 审校 | 交互体验、版本保护 |
+| **应用流水线** | 书童、AI_NovelGenerator、CastNovel | 上下文注入 + 状态回写 + 审校 | 交互体验、版本保护 |
 | **Agent/Skill 包** | oh-story(8k★)、webnovel-writer(7.7k★)、inkos(10.8k★)、chinese-novelist-skill(4.4k★) | 事实账本、状态卡、hooks 门禁 | 门禁哲学、方法论组织 |
 | **程序化流水线** | wfcz10086、天命、inkflow | 合同树/快照门禁/双层审计,代码说了算 | 确定性校验、熔断 |
 
@@ -50,16 +51,20 @@
 | EPUB 导出 | ✅ | Openwrite、gpt-author |
 | 强/快模型分档 + 用量 | ✅ | AI_NovelGenerator、Openwrite |
 | mock 离线模式 | ✅ | (自研,测试友好) |
-| 确定性去 AI 味 lint(行号+改写方向) | ✅ v0.2(规则集) | oh-story lint、Humanizer-zh |
+| 确定性去 AI 味 lint(13 条规则+改写方向,并入门禁) | ✅ v0.2 | oh-story lint、Humanizer-zh、inkflow |
+| span 级检测+带例改写两步管线 | 🔮 v0.3 | arXiv:2409.14509 |
 | 读者认知状态(已知/期待/误认) | 🔮 v0.3 | goink、oh-story 双时间线、inkflow 信息边界 |
-| Lorebook 关键词触发注入 | 🔮 v0.3 | SillyTavern/NovelAI World Info |
+| Lorebook 兼容引擎(ST JSON 导入导出) | 🔮 v0.3 | SillyTavern/NovelAI/KoboldAI World Info |
 | 级联大纲影响分析 | 🔮 v0.4 | jarvis-write |
 | 生成候选拉样+择优 | 🔮 v0.4 | Re3、Plan-and-Write、inkos forecast |
 | 向量语义检索(可选) | 🔮 v0.4 | goink、moshu |
+| 信息边界过滤(POV 知识台账) | 🔮 v0.4 | dramatica-flow、novel-studio |
+| 设定变更「提案-批准」流 | 🔮 v0.4 | show-me-the-story、ai-novel-studio |
 | 时间性事实(绑定章节有效区间) | 🔮 v1.0 | jarvis-write |
 | 事实账本 + 只读投影 | 🔮 v1.0 | webnovel-writer |
+| 章节提交链分叉/合流 | 🔮 v1.0 | webnovel-writer + ST 分支语义 |
 | 扫榜/拆文前置链路 | 🔮 v1.0 | oh-story、tianyan、fanqie-radar |
-| 可插拔方法论 Skill | 🔮 v1.0 | goink、inkos |
+| 可插拔方法论 Skill(阶段绑定) | 🔮 v1.0 | goink、inkos、Pagekin SKILL.md |
 
 ## 4. 系统架构
 
@@ -116,10 +121,12 @@
 | 状态层 | 待回收伏笔清单(≤8 条)+人物当前状态(嵌在档案行内) | ~800 |
 
 **演进**:
-- v0.3 **Lorebook 关键词触发**(SillyTavern/NovelAI World Info):给设定条目配触发词,正文提到才注入——解决"设定多了全塞爆预算"的问题;实现为 characters/foreshadowing 表加 `keywords` 列 + 注入过滤器,零新依赖。
+- v0.3 **Lorebook 兼容引擎**(World Info 机制详见 research.md 十一节):设定条目 = 六字段核心(`keys` 主键 / `secondary` 次键(AND-ANY|ALL、NOT-ANY|ALL)/ `content` / `constant` 常驻 / `order` 注入顺序(大=更深)/ `budget` 预算),扫描缓冲区命中才注入,常驻条目优先、按序填充至预算耗尽;先实现该子集,**导入导出兼容 SillyTavern lorebook JSON**,直接复用生态数千份现成 worldbook;角色/伏笔即「带生命周期包装的 lorebook 条目」——伏笔命中本章节拍词时自动注入。
 - v0.3 **两步矛盾检查**(ConStory-Checker,[arXiv:2603.05890](https://arxiv.org/abs/2603.05890)):按错误类目(时间线/人物/世界观/事实细节/叙事)抽取可疑片段 → 两两核验带证据链;实证显示事实细节与时间线错误占主导、随长度线性增长。
 - v0.4 **可选向量检索**:配置了 embedding API 时自动启用(余弦+MMR 重排),否则维持 BM25;向量维度绑定档案名防跨模型污染(墨枢)。
+- v0.4 **信息边界过滤**(dramatica-flow/novel-studio):人物带「知识台账(事实+出处章)」,上下文编译时按 POV 过滤——人物不该知道的内容不进其可读上下文;与「读者认知状态」同属视角状态层。
 - v1.0 **时间性事实**(jarvis-write + Narrative World Model):人物/设定事实绑定 `[start_ch, end_ch]`,查询"第 N 章时的状态";上下文注入时只取 `start_ch ≤ N` 的事实,并把 `end_ch = N-1` 的变化作为"刚发生的事"注入。
+- v1.0 **章节提交链 + 分支**(webnovel-writer + ST 分支继承):定稿即 CHAPTER_COMMIT,状态/摘要/索引均为只读投影;支持从任意提交分叉时间线、并行再生、择一合回正典。
 
 **学术背书**:NstAgent([arXiv:2609.35759](https://arxiv.org/abs/2609.35759),清华 2026)验证了同构路线——**双向叙事状态**(人物快照 + 过去事件 + 未来义务/未回收伏笔),写手只见「大纲+状态+检索证据」,永不喂原文,每章一次原子 JSON 更新;10 万字场景下一致性显著优于滚动摘要基线,且差距随长度扩大。本项目的伏笔账本即「未来义务」,三层记忆即其检索证据层。
 
@@ -135,8 +142,10 @@
 ```
 
 **演进**:
-- v0.3 **确定性 lint**(oh-story/Humanizer-zh):本地正则规则集检测 AI 味句式(「不是…而是…」排比、模板动作、空洞套话),给行号 + 改写方向,分 blocking/advisory;规则文件外置可编辑。
+- v0.2 已实现**确定性 lint 规则集**(13 条 AI 味模板规则 + 破折号配额,advisory 级并入门禁;规则数据化可扩展);
+- v0.3 **两步 span 级管线**升级(oh-story/Humanizer-zh/arXiv:2409.14509):片段检测(行号+规则)→ 带专家改写例的按类目定点重写,偏删除;规则文件外置可编辑。
 - v0.3 **读者认知状态**(goink/oh-story):新增 `reader_knowledge` 投影——读者已知(正文出现过)/人物已知(区分视角)/伏笔期待;定稿时与状态一起抽取,审校时提示"读者尚不知 X,此处反转是否过早"。
+- v0.4 **设定变更提案-批准流**(show-me-the-story):AI 修改设定一律先出提案,作者批准才入账。
 - v1.0 **事实账本**(webnovel-writer):状态库为唯一权威,摘要/检索索引全部为只读派生投影,提供一致性自检命令;模型输出一律"提案",经校验才入账(ai-novel-studio 原则)。
 
 ### 5.3 质量体系
@@ -183,10 +192,10 @@
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | v0.1 | 五页签工作台 + 三层记忆 + 流水线 + SSE + mock | ✅ 2026-10-27 |
-| v0.2 | 门禁(字数/人物覆盖/重复率/**AI味 lint**)、版本回滚、批量连写(熔断)、情节线、文风样本、EPUB | ✅ 2026-10-28 |
-| v0.3 | span 级检测+带例改写两步管线、Lorebook 关键词触发、两步矛盾检查、读者认知状态 | 规划 |
-| v0.4 | 级联大纲影响分析、候选拉样+成对择优、可选向量检索、动态大纲(DOME) | 规划 |
-| v1.0 | 时间性事实、事实账本投影、扫榜拆文前置、可插拔 Skill | 远期 |
+| v0.2 | 门禁(字数/人物覆盖/重复率/AI味 lint)、版本回滚、批量连写(熔断)、情节线、文风样本、EPUB | ✅ 2026-10-28 |
+| v0.3 | span 级检测+带例改写两步管线、Lorebook 兼容引擎(ST JSON)、两步矛盾检查、读者认知状态 | 规划 |
+| v0.4 | 级联大纲影响分析、候选拉样+成对择优、可选向量检索、信息边界过滤、动态大纲(DOME) | 规划 |
+| v1.0 | 时间性事实、事实账本投影、章节提交链分叉、扫榜拆文前置、阶段绑定 Skill 包 | 远期 |
 
 ## 8. 非目标
 

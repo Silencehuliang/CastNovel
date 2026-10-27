@@ -1,4 +1,4 @@
-/* NovelForge 铸书 · 前端工作台(vanilla JS,无构建依赖) */
+/* CastNovel 铸书 · 前端工作台(vanilla JS,无构建依赖) */
 "use strict";
 
 const $ = (sel, root) => (root || document).querySelector(sel);
