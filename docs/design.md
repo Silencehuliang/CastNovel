@@ -44,11 +44,13 @@
 | 章节版本历史 + 回滚 | ✅ | goink、书童 |
 | 批量连写 + 熔断 | ✅ | wfcz10086、chinese-novelist-skill |
 | 去 AI 味润色(负面清单 + 文风样本) | ✅ | chinese-novelist-skill、goink |
+| 确定性去 AI 味 lint(规则集+改写方向,并入门禁) | ✅ | oh-story lint、Humanizer-zh、inkflow |
+| span 级检测+带例改写两步管线 | 🔮 v0.3 | arXiv:2409.14509 |
 | 拆书导入 | ✅ | Long-Novel-GPT、书童 |
 | EPUB 导出 | ✅ | Openwrite、gpt-author |
 | 强/快模型分档 + 用量 | ✅ | AI_NovelGenerator、Openwrite |
 | mock 离线模式 | ✅ | (自研,测试友好) |
-| 确定性去 AI 味 lint(行号+改写方向) | 🔮 v0.3 | oh-story lint、Humanizer-zh |
+| 确定性去 AI 味 lint(行号+改写方向) | ✅ v0.2(规则集) | oh-story lint、Humanizer-zh |
 | 读者认知状态(已知/期待/误认) | 🔮 v0.3 | goink、oh-story 双时间线、inkflow 信息边界 |
 | Lorebook 关键词触发注入 | 🔮 v0.3 | SillyTavern/NovelAI World Info |
 | 级联大纲影响分析 | 🔮 v0.4 | jarvis-write |
@@ -181,8 +183,8 @@
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | v0.1 | 五页签工作台 + 三层记忆 + 流水线 + SSE + mock | ✅ 2026-10-27 |
-| v0.2 | 门禁、版本回滚、批量连写(熔断)、情节线、文风样本、EPUB | ✅ 2026-10-28 |
-| v0.3 | 确定性 AI 味 lint(两步 span 级管线)、Lorebook 关键词触发、两步矛盾检查、读者认知状态 | 规划 |
+| v0.2 | 门禁(字数/人物覆盖/重复率/**AI味 lint**)、版本回滚、批量连写(熔断)、情节线、文风样本、EPUB | ✅ 2026-10-28 |
+| v0.3 | span 级检测+带例改写两步管线、Lorebook 关键词触发、两步矛盾检查、读者认知状态 | 规划 |
 | v0.4 | 级联大纲影响分析、候选拉样+成对择优、可选向量检索、动态大纲(DOME) | 规划 |
 | v1.0 | 时间性事实、事实账本投影、扫榜拆文前置、可插拔 Skill | 远期 |
 

@@ -11,6 +11,7 @@ from app import db, prompts
 from app.config import load_settings, resolve_profile
 from app.llm import chat, extract_json
 from app.memory import build_context
+from app.lint import lint_text
 
 
 def _load(pid):
@@ -60,6 +61,10 @@ def run_gate(settings, project, chapters, characters, chapter):
             worst = max(worst, len(cur & other) / len(union))
     if worst > 0.12:
         issues.append({"type": "重复", "level": "warn", "msg": f"与近三章的最大文本重复率约 {worst:.0%},疑似复述旧情节"})
+
+    # 第 2.5 道:确定性去 AI 味 lint(零 token,规则可扩展)
+    for li in lint_text(content):
+        issues.append({"type": "AI味", "level": li["level"], "msg": f"{li['msg']}(出现 {li['count']} 次)。改写方向:{li['suggestion']}"})
 
     return {
         "words": words,
