@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NovelForge · 铸书 — AI 长篇小说创作工坊</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <aside id="sidebar">
+    <div class="logo">NovelForge<span class="logo-cn">铸书</span></div>
+    <button id="btnNew" class="btn btn-primary btn-block">＋ 新建作品</button>
+    <div id="projectList" class="project-list"></div>
+    <div class="sidebar-foot">
+      <div id="mockBanner" class="mock-banner hidden">
+        当前为「离线演示」模型,输出为模拟文本。请在设置中配置 API Key。
+      </div>
+      <button id="btnSettings" class="btn btn-ghost btn-block">⚙ 设置</button>
+    </div>
+  </aside>
+
+  <main id="main">
+    <header id="topbar">
+      <div id="projTitle" class="proj-title">未选择作品</div>
+      <nav id="tabs" class="tabs hidden">
+        <button data-tab="setting" class="tab active">设定</button>
+        <button data-tab="outline" class="tab">大纲</button>
+        <button data-tab="write" class="tab">写作</button>
+        <button data-tab="review" class="tab">审校</button>
+        <button data-tab="export" class="tab">导出</button>
+      </nav>
+    </header>
+    <section id="view">
+      <div class="empty-hint">
+        <h2>铸书 · NovelForge</h2>
+        <p>设定 → 大纲 → 章纲 → 正文 → 审校 → 定稿,分层生成、全程可编辑。</p>
+        <p>左侧选择或新建一部作品开始。</p>
+      </div>
+    </section>
+  </main>
+
+  <div id="modalRoot"></div>
+  <div id="toast" class="hidden"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

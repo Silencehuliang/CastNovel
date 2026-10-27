@@ -1,0 +1,136 @@
+"""三层记忆系统:为每章生成组装「结构化上下文」。
+
+1. 静态层:世界观、文风、角色档案(故事圣经);
+2. 序列层:全书各章摘要(滚动压缩)+ 上一章结尾原文(口吻衔接);
+3. 检索层:对旧章摘要做字符二元组 BM25 检索,把与本章最相关的旧情节拉回上下文;
+   另附「待回收伏笔」清单,供正文呼应。
+
+全部中文友好、零外部依赖(不强制 embedding API)。
+"""
+import math
+import re
+from collections import Counter
+
+
+def _tokens(text):
+    text = (text or "").lower()
+    words = re.findall(r"[a-z0-9]+", text)
+    han = re.sub(r"[^\u4e00-\u9fff]+", " ", text)
+    bigrams = []
+    for seg in han.split():
+        if len(seg) == 1:
+            bigrams.append(seg)
+        else:
+            bigrams.extend(seg[i:i + 2] for i in range(len(seg) - 1))
+    return words + bigrams
+
+
+def topk_chunks(query, docs, k=3):
+    """docs: [{"id", "text"}],返回最相关的 id 列表(简单 idf 加权)。"""
+    if not docs:
+        return []
+    q = Counter(_tokens(query))
+    doc_toks = [Counter(_tokens(d["text"])) for d in docs]
+    df = Counter()
+    for toks in doc_toks:
+        df.update(toks.keys())
+    n = len(docs)
+    scores = []
+    for idx, toks in enumerate(doc_toks):
+        s = 0.0
+        for t, c in q.items():
+            if t in toks and df.get(t):
+                s += c * math.log(1 + n / df[t])
+        scores.append((s, idx))
+    scores.sort(key=lambda x: -x[0])
+    return [docs[i]["id"] for s, i in scores[:k] if s > 0]
+
+
+def _clip(text, limit):
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def build_context(project, characters, chapters, foreshadowing, target_idx, settings):
+    """组装写第 target_idx 章时所需的上下文文本。"""
+    gen = settings.get("gen", {})
+    world_limit = 2200
+    char_limit = 280
+    summ_limit = 240
+
+    parts = []
+    worldview = _clip(project.get("worldview"), world_limit)
+    if worldview:
+        parts.append("【世界观与既定事实】\n" + worldview)
+    if project.get("style"):
+        parts.append("【文风要求】" + _clip(project["style"], 300))
+
+    beats_txt = ""
+    for ch in chapters:
+        if ch["idx"] == target_idx:
+            beats_txt = ch.get("beats") or ""
+    query = " ".join(
+        x for x in [project.get("premise", ""), project.get("genre", ""), beats_txt] if x
+    )
+
+    # 角色档案:数量少全给,数量多按相关性挑选
+    chars = list(characters)
+    if len(chars) > 8 and query:
+        docs = [{"id": c["name"], "text": f"{c['name']} {c['role']} {c['profile']} {query}"} for c in chars]
+        keep = set(topk_chunks(query, docs, k=8))
+        chars = [c for c in chars if c["name"] in keep]
+    if chars:
+        lines = [
+            f"- {c['name']}({c['role'] or '角色'}):{_clip(c['profile'], char_limit)}"
+            + (f"【当前状态:{_clip(c['status'], 80)}】" if c.get("status") else "")
+            for c in chars
+        ]
+        parts.append("【主要角色档案】\n" + "\n".join(lines))
+
+    prev = [ch for ch in chapters if ch["idx"] < target_idx and (ch.get("summary") or ch.get("content"))]
+    if prev:
+        window = int(gen.get("summary_window", 6))
+        recent = prev[-window:]
+        older = prev[:-window]
+        lines = []
+        for ch in older:
+            lines.append(f"第{ch['idx']}章《{ch.get('title', '')}》")
+        for ch in recent:
+            s = ch.get("summary") or _clip(ch.get("content"), summ_limit)
+            lines.append(f"第{ch['idx']}章《{ch.get('title', '')}》:{_clip(s, summ_limit)}")
+        parts.append("【前情脉络】\n" + "\n".join(lines))
+
+    last = next((ch for ch in chapters if ch["idx"] == target_idx - 1), None)
+    if last and last.get("content"):
+        tail = _clip(last["content"][-1400:], 1400)
+        parts.append("【上一章结尾(衔接口吻,勿复述)】\n" + tail)
+
+    # 检索层:旧章摘要 + 开头片段
+    if query and prev:
+        docs = []
+        for ch in prev:
+            docs.append({
+                "id": ch["idx"],
+                "text": f"第{ch['idx']}章《{ch.get('title', '')}》 {(ch.get('summary') or '')} {(ch.get('content') or '')[:400]}",
+            })
+        topk = int(gen.get("retrieval_topk", 3))
+        ids = set(topk_chunks(query, docs, k=topk))
+        hits = [d for d in docs if d["id"] in ids and d["id"] != (last or {}).get("idx")]
+        if hits:
+            lines = []
+            by_idx = {ch["idx"]: ch for ch in prev}
+            for d in hits:
+                ch = by_idx.get(d["id"], {})
+                frag = _clip((ch.get("summary") or (ch.get("content") or "")[:300]), 300)
+                lines.append(f"第{ch.get('idx')}章《{ch.get('title', '')}》:{frag}")
+            parts.append("【与本章相关的旧情节(避免重复、注意呼应)】\n" + "\n".join(lines))
+
+    open_fs = [f for f in (foreshadowing or []) if f.get("status") == "open"]
+    if open_fs:
+        lines = [
+            f"- {f['title']}:{_clip(f.get('description'), 100)}"
+            for f in open_fs[:8]
+        ]
+        parts.append("【待回收伏笔(可在合适节点呼应,勿强行填坑)】\n" + "\n".join(lines))
+
+    return "\n\n".join(parts)
