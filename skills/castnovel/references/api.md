@@ -1,6 +1,6 @@
 # CastNovel API 速查(MCP 工具 + REST 端点)
 
-## MCP 工具(mcp_server.py,stdio,共 22 个)
+## MCP 工具(mcp_server.py,stdio,共 25 个)
 
 ### 作品
 | 工具 | 参数 | 说明 |
@@ -37,6 +37,8 @@
 |---|---|
 | `list_lore_entries` / `upsert_lore_entry` / `delete_lore_entry` | Lorebook:关键词命中即注入上下文 |
 | `search_impact` | 设定变更影响分析:按关键词反查受影响章节(零 token) |
+| `get_reader_state` / `edit_reader_state` | 读者认知(已知/期待/误认):定稿自动抽取,写作自动注入;手工修正 |
+| `run_gate_check` | 对当前正文重跑一致性门禁(零 token),update_chapter 后调用 |
 
 ## REST 端点(服务 `python main.py [端口]`,前缀 `/api`)
 

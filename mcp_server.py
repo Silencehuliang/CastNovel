@@ -161,6 +161,13 @@ def get_project_overview(project_id: int, worldview_chars: int = 800) -> str:
     if plots:
         out += ["", f"情节线（{len(plots)}）:"]
         out += [f"  - [{p['status']}] {p['title']}" for p in plots[:20]]
+    reader = db.list_reader(project_id, only_open=True)
+    if reader:
+        cnt = {"known": 0, "expect": 0, "mislead": 0}
+        for r in reader:
+            cnt[r["kind"] if r["kind"] in cnt else "known"] += 1
+        out += ["", f"读者认知(进行中):已知 {cnt['known']} / 期待 {cnt['expect']} / 误认 {cnt['mislead']}"
+                " —— 生成时自动注入;详情用 get_reader_state"]
     return "\n".join(out)
 
 
@@ -538,6 +545,63 @@ def deai_rewrite_chapter(project_id: int, chapter_idx: int, adopt: bool = False,
         return f"改写稿已采用({len(r['text'])} 字),旧稿已快照。{r.get('note', '')}\n\n{_clip(r['text'], preview_chars)}"
     return (f"命中 {len(r['spans'])} 处:{'; '.join(s['span'] for s in r['spans'][:6])}…\n"
             f"{r.get('note', '')}\n确认后可用 adopt=True 重跑,或 update_chapter 手工写入。\n\n{_clip(r['text'], preview_chars)}")
+
+
+# ---------- 读者认知 + 门禁 ----------
+
+@mcp.tool()
+def get_reader_state(project_id: int, only_open: bool = True) -> str:
+    """查看读者认知状态(读者已知/期待/误认,与角色已知、作者真相分离)。
+
+    定稿章节时自动抽取;写作时自动注入上下文:已知防复述、期待管兑现、误认控反转时机。
+    """
+    _need_project(project_id)
+    rows = db.list_reader(project_id, only_open=only_open)
+    if not rows:
+        return "暂无读者认知记录(定稿章节后自动生成,也可手工登记)。"
+    labels = {"known": "已知", "expect": "期待", "mislead": "误认"}
+    lines = []
+    for kind in ("known", "expect", "mislead"):
+        items = [r for r in rows if r["kind"] == kind]
+        if items:
+            lines.append(f"{labels[kind]}({len(items)}):")
+            lines += [f"  - {r['content']}" + (f"(第{r['chapter_idx']}章起)" if r["chapter_idx"] else "") for r in items[-10:]]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def edit_reader_state(state_id: int, action: str = "resolve", content: str = "") -> str:
+    """手工修正读者认知条目:action=resolve(标记已兑现/已揭穿)、reopen、delete,或 content 更新文本。"""
+    row = db.one("SELECT * FROM reader_state WHERE id=?", (state_id,))
+    if not row:
+        return f"错误:id={state_id} 的读者认知条目不存在(可用 get_reader_state 查看)"
+    if action == "delete":
+        db.delete_reader(state_id)
+        return f"已删除条目「{row['content'][:30]}」"
+    if action == "resolve":
+        db.update_reader(state_id, {"status": "done"})
+        return f"已了结:「{row['content'][:30]}」"
+    if action == "reopen":
+        db.update_reader(state_id, {"status": "open"})
+        return f"已重新打开:「{row['content'][:30]}」"
+    if content.strip():
+        db.update_reader(state_id, {"content": content.strip()})
+        return f"已更新:「{row['content'][:30]}」→「{content.strip()[:30]}」"
+    return "未识别的 action(可用:resolve/reopen/delete)或未提供 content"
+
+
+@mcp.tool()
+def run_gate_check(project_id: int, chapter_idx: int) -> str:
+    """对章节当前正文重跑一致性门禁(字数/角色覆盖/重复率/AI 味,零 token)。
+
+    用 update_chapter 改完正文后调用,刷新门禁徽章并获取告警清单。
+    """
+    ch = _need_chapter(project_id, chapter_idx)
+    try:
+        gate = stages.recompute_gate(project_id, ch["id"])
+    except Exception as e:
+        return f"错误:{e}"
+    return f"第{chapter_idx}章门禁重算完成。\n{_gate_brief(gate)}"
 
 
 if __name__ == "__main__":

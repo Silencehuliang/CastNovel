@@ -227,8 +227,9 @@ async function renderSetting(view) {
   const p = curProject();
   const chars = state.bundle.characters;
   const fores = state.bundle.foreshadowing;
-  let lore = [];
+  let lore = [], reader = [];
   try { lore = await api(`/projects/${state.pid}/lore`); } catch (e) { /* 忽略,渲染空表 */ }
+  try { reader = await api(`/projects/${state.pid}/reader`); } catch (e) { /* 忽略 */ }
   view.innerHTML = `
     <div class="card">
       <h3>作品信息 <span class="hint">梗概与文风是所有生成的起点,务必先写好</span></h3>
@@ -334,6 +335,30 @@ async function renderSetting(view) {
         <button class="btn" id="btnAddLore">＋ 添加条目</button>
       </div>
     </div>
+
+    <div class="card">
+      <h3>读者认知状态 <span class="hint">读者已知/期待/误认,与角色已知、作者真相分离;定稿时自动抽取,生成时注入防复述、管期待、控误导</span></h3>
+      <table class="tbl">
+        <thead><tr><th style="width:80px">类型</th><th>内容(读者视角)</th><th style="width:70px">起于</th><th style="width:80px">状态</th><th style="width:56px"></th></tr></thead>
+        <tbody>
+          ${reader.map(r => `
+            <tr data-rid="${r.id}">
+              <td><span class="badge ${r.kind === "known" ? "b-open" : r.kind === "expect" ? "b-drafting" : "b-中"}">${{ known: "已知", expect: "期待", mislead: "误认" }[r.kind] || r.kind}</span></td>
+              <td><input type="text" data-rcontent value="${esc(r.content)}"></td>
+              <td>${r.chapter_idx ?? "—"}</td>
+              <td><span class="badge ${r.status === "open" ? "b-open" : "b-resolved"} data-rtoggle="${r.id}" style="cursor:pointer">${r.status === "open" ? "进行中" : "已了结"}</span></td>
+              <td><button class="btn btn-sm btn-danger" data-rdel="${r.id}">删除</button></td>
+            </tr>`).join("") || `<tr><td colspan="5" style="color:var(--ink-soft)">暂无记录,定稿章节后自动抽取;也可手工登记</td></tr>`}
+        </tbody>
+      </table>
+      <div class="row" style="margin-top:10px;">
+        <select id="reader-kind" style="max-width:110px">
+          <option value="known">已知</option><option value="expect">期待</option><option value="mislead">误认</option>
+        </select>
+        <input type="text" id="reader-content" placeholder="例如:读者已知玉佩是身世信物" style="flex:1">
+        <button class="btn" id="btnAddReader">＋ 登记</button>
+      </div>
+    </div>
   `;
 
   $("#btnSaveInfo").onclick = saveProjectInfo;
@@ -376,6 +401,33 @@ async function renderSetting(view) {
         method: "PUT",
         body: JSON.stringify({ keywords: $("[data-lkeywords]", tr).value, content: $("[data-lcontent]", tr).value }),
       });
+      state.dirty = false;
+    });
+  });
+  $("#btnAddReader").onclick = async () => {
+    const ct = $("#reader-content").value.trim();
+    if (!ct) { toast("请填写内容", true); return; }
+    await api(`/projects/${state.pid}/reader`, {
+      method: "POST", body: JSON.stringify({ kind: $("#reader-kind").value, content: ct }) });
+    toast("读者认知已登记,生成时自动注入");
+    await loadProject(); renderSetting(view);
+  };
+  $$("[data-rtoggle]").forEach(el => el.onclick = async () => {
+    const rid = el.dataset.rtoggle;
+    const open = el.textContent === "已了结";
+    await api(`/projects/${state.pid}/reader/${rid}`, { method: "PUT", body: JSON.stringify({ status: open ? "open" : "done" }) });
+    await loadProject(); renderSetting(view);
+  });
+  $$("[data-rdel]").forEach(el => el.onclick = async () => {
+    if (!confirm("删除该条读者认知?")) return;
+    await api(`/projects/${state.pid}/reader/${el.dataset.rdel}`, { method: "DELETE" });
+    await loadProject(); renderSetting(view);
+  });
+  $$("[data-rcontent]").forEach(el => {
+    el.addEventListener("input", markDirty);
+    el.addEventListener("blur", async () => {
+      await api(`/projects/${state.pid}/reader/${el.closest("tr").dataset.rid}`, {
+        method: "PUT", body: JSON.stringify({ content: el.value }) });
       state.dirty = false;
     });
   });
@@ -717,6 +769,7 @@ function renderWrite(view) {
         <label style="font-size:12.5px"><input type="checkbox" id="batch-review"> 每章审校</label>
         <button class="btn btn-sm" data-lock id="btnBatch" title="对未写章节依次:章纲→正文(→审校)→定稿">⚡ 批量连写</button>
         <span style="flex:1"></span>
+        <button class="btn btn-sm" id="btnRegate" title="对当前正文重跑一致性门禁(零 token),刷新徽章">重跑门禁</button>
         <button class="btn btn-sm" id="btnVersions">🕘 版本历史</button>
         <button class="btn btn-sm" id="btnSnapshot">保存快照</button>
       </div>
@@ -820,6 +873,16 @@ function renderWrite(view) {
     renderWrite(view);
   };
   $("#btnBatch").onclick = runBatch;
+  $("#btnRegate").onclick = async () => {
+    if (!(ch.content || "").trim()) { toast("本章无正文,无需门禁", true); return; }
+    try {
+      const g = await api(`/projects/${state.pid}/chapters/${state.cid}/gate`, { method: "POST", body: "{}" });
+      ch.gate = JSON.stringify(g);
+      $("#w-gate").innerHTML = gateBadges(ch);
+      const warns = (g.issues || []).filter(i => i.level === "warn").length;
+      toast(warns ? `门禁完成:${warns} 项 warn 级告警` : "门禁通过 ✓");
+    } catch (e) { toast(e.message, true); }
+  };
   $("#btnVersions").onclick = () => openVersions(view);
   $("#btnSnapshot").onclick = async () => {
     const note = prompt("版本备注:", "手动快照");

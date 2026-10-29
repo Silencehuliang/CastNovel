@@ -105,6 +105,15 @@ CREATE TABLE IF NOT EXISTS embeddings(
   updated_at TEXT DEFAULT (datetime('now','localtime')),
   PRIMARY KEY(project_id, idx, model_tag)
 );
+CREATE TABLE IF NOT EXISTS reader_state(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,            -- known(读者已知) / expect(读者期待) / mislead(读者误认)
+  content TEXT NOT NULL,
+  chapter_idx INTEGER,
+  status TEXT DEFAULT 'open',    -- open / done(期待已兑现、误认已揭穿)
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
 """
 
 # 运行时增量迁移:旧库缺列时补齐
@@ -431,6 +440,61 @@ def save_embedding(pid, idx, model_tag, vector):
         "ON CONFLICT(project_id,idx,model_tag) DO UPDATE SET vector=excluded.vector, updated_at=excluded.updated_at",
         (pid, idx, model_tag, json.dumps(vector)),
     )
+
+
+# ---------- 读者认知状态(与角色已知/作者真相分离) ----------
+
+READER_KINDS = ("known", "expect", "mislead")
+
+
+def list_reader(pid, only_open=False):
+    sql = "SELECT * FROM reader_state WHERE project_id=?"
+    if only_open:
+        sql += " AND status='open'"
+    return q(sql + " ORDER BY id", (pid,))
+
+
+def upsert_reader(pid, kind, content, chapter_idx=None, action="add"):
+    """定稿抽取入口:add 新增(kind 限 known/expect/mislead,同内容去重);
+    resolve 按 content 匹配未结条目 → 置 done(期待兑现/误认揭穿)。"""
+    content = (content or "").strip()
+    kind = kind if kind in READER_KINDS else "known"
+    if not content:
+        return
+    row = one(
+        "SELECT id, status FROM reader_state WHERE project_id=? AND kind=? AND content=?",
+        (pid, kind, content),
+    )
+    if action == "resolve":
+        if row and row["status"] == "open":
+            run("UPDATE reader_state SET status='done' WHERE id=?", (row["id"],))
+            return
+        like = one(
+            "SELECT id, status FROM reader_state WHERE project_id=? AND kind=? AND status='open' "
+            "AND (? LIKE '%'||content||'%' OR content LIKE '%'||?||'%') LIMIT 1",
+            (pid, kind, content, content),
+        )
+        if like:
+            run("UPDATE reader_state SET status='done' WHERE id=?", (like["id"],))
+        return
+    if row:
+        return
+    run(
+        "INSERT INTO reader_state(project_id,kind,content,chapter_idx) VALUES(?,?,?,?)",
+        (pid, kind, content, chapter_idx),
+    )
+
+
+def update_reader(rid, fields: dict):
+    allowed = {k: fields[k] for k in ("kind", "content", "status", "chapter_idx") if k in fields}
+    if not allowed:
+        return
+    sets = ", ".join(f"{k}=?" for k in allowed)
+    run(f"UPDATE reader_state SET {sets} WHERE id=?", (*allowed.values(), rid))
+
+
+def delete_reader(rid):
+    run("DELETE FROM reader_state WHERE id=?", (rid,))
 
 
 def add_usage(pid, stage, prompt_chars, completion_chars):

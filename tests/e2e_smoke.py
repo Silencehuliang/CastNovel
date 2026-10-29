@@ -148,6 +148,13 @@ ctxl = req("GET", f"/api/projects/{pid}/chapters/{cid}/context")
 assert "Lorebook" in ctxl["context"] and "玉佩在雷雨夜发烫" in ctxl["context"], "Lorebook 未注入上下文"
 step("Lorebook关键词注入", lambda: "已注入")
 
+rs = req("GET", f"/api/projects/{pid}/reader")
+assert any(r["kind"] == "known" for r in rs), "读者认知未抽取(定稿应产生 known 条目)"
+assert any(r["kind"] == "expect" for r in rs), "读者认知未抽取(定稿应产生 expect 条目)"
+ctxr = req("GET", f"/api/projects/{pid}/chapters/{cid}/context")
+assert "读者认知状态" in ctxr["context"] and "读者已知" in ctxr["context"], "读者认知未注入上下文"
+step("读者认知抽取+注入", lambda: f"{len(rs)} 条")
+
 imp = req("GET", f"/api/projects/{pid}/impact?query=%E7%8E%89%E4%BD%A9")  # 玉佩(URL编码)
 assert imp["affected"], "影响反查未命中(玉佩应出现在正文/章纲)"
 step("影响反查", lambda: f"命中 {len(imp['affected'])} 章")
@@ -164,6 +171,9 @@ newch = req("POST", f"/api/projects/{pid}/chapters")
 _, cas = step("级联重生成1章", lambda: req("POST", f"/api/projects/{pid}/cascade",
                                           {"chapter_ids": [newch["id"]], "include_written": False}))
 assert cas and cas["done"] == 1, cas
+
+g = step("门禁重算", lambda: req("POST", f"/api/projects/{pid}/chapters/{c2b['id']}/gate"))
+assert g.get("words") > 0 and isinstance(g.get("issues"), list), g
 
 st0 = req("GET", "/api/settings")
 profs = st0["settings"]["profiles"]

@@ -82,9 +82,10 @@ def _ctx_parts(pid, target_idx, settings):
     chapters = db.list_chapters(pid)
     fores = db.list_foreshadowing(pid)
     lore = db.list_lore(pid, only_enabled=True)
+    reader = db.list_reader(pid)
     qvec, dvecs = _vector_aux(pid, chapters, target_idx, settings)
     context = build_context(project, characters, chapters, fores, target_idx, settings,
-                            lore=lore, query_vec=qvec, doc_vectors=dvecs)
+                            lore=lore, query_vec=qvec, doc_vectors=dvecs, reader=reader)
     return project, characters, chapters, context
 
 
@@ -363,8 +364,22 @@ def cascade_regenerate(pid, chapter_ids, include_written=False, on_event=None):
     return {"done": done, "total": len(ids)}
 
 
+def recompute_gate(pid, cid):
+    """对章节当前正文重跑一致性门禁并保存(零 token)。手工编辑/采用新稿后调用,保持徽章新鲜。"""
+    settings = load_settings(db)
+    chapter = db.get_chapter(cid)
+    if not chapter or not (chapter.get("content") or "").strip():
+        raise ValueError("本章无正文,无需门禁")
+    project = db.get_project(pid)
+    characters = db.list_characters(pid)
+    chapters = db.list_chapters(pid)
+    gate = run_gate(settings, project, chapters, characters, chapter)
+    db.update_chapter(cid, {"gate": json.dumps(gate, ensure_ascii=False)})
+    return gate
+
+
 def adopt_content(pid, cid, content, note=""):
-    """采用新稿(润色/修订/回滚确认):旧稿先做版本快照。"""
+    """采用新稿(润色/修订/回滚确认):旧稿先做版本快照,随后自动重跑门禁。"""
     chapter = db.get_chapter(cid)
     if not chapter:
         raise ValueError("章节不存在")
@@ -372,6 +387,10 @@ def adopt_content(pid, cid, content, note=""):
         db.add_version(cid, note or "采用新稿前自动保存")
     db.update_chapter(cid, {"content": content})
     db.touch_project(pid)
+    try:
+        recompute_gate(pid, cid)
+    except Exception:
+        pass  # 门禁失败不阻塞采用(如空稿)
     return db.get_chapter(cid)
 
 
@@ -454,6 +473,10 @@ def finalize_chapter(pid, cid):
         if isinstance(pl, dict) and pl.get("title"):
             db.upsert_plotline(pid, pl.get("title", ""), pl.get("description", ""),
                                pl.get("action", "start"), idx)
+    for r in state.get("reader_state", []) or []:
+        if isinstance(r, dict) and r.get("content"):
+            db.upsert_reader(pid, r.get("kind", "known"), r.get("content", ""),
+                             idx, r.get("action", "add"))
     db.update_chapter(cid, {"status": "final"})
     db.touch_project(pid)
     db.add_log(pid, "finalize", f"第{idx}章 定稿,摘要 {len(summary_text)}字")

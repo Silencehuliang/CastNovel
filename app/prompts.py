@@ -185,16 +185,22 @@ def summary_messages(project, chapter, prev_summaries, content):
 
 
 def state_extract_messages(project, chapter, content, known_chars, open_fores):
-    user = f"""阅读第 {chapter['idx']} 章《{chapter.get('title', '')}》正文,抽取叙事状态变化,输出 JSON:
+    user = f"""阅读第 {chapter['idx']} 章《{chapter.get('title', '')}》正文,抽取叙事状态变化与读者认知,输出 JSON:
 {{"characters": [{{"name": "人物名(必须是已知人物或新出场人物)", "role": "主角/配角/反派/新角色 等", "profile": "仅新角色填写:60字内介绍;已知人物填空字符串", "status": "本章后的最新状态:伤势/修为/位置/关系变化等,30字内"}}],
 "foreshadowing": [{{"title": "伏笔名(10字内)", "description": "伏笔内容,40字内", "action": "plant 或 resolve"}}],
-"plotlines": [{{"title": "情节线名(10字内,如:复仇线/感情线/寻宝线)", "description": "该线当前进展,40字内", "action": "start、advance 或 end"}}]}}
+"plotlines": [{{"title": "情节线名(10字内,如:复仇线/感情线/寻宝线)", "description": "该线当前进展,40字内", "action": "start、advance 或 end"}}],
+"reader_state": [{{"kind": "known 或 expect 或 mislead", "content": "读者视角的一句话,30字内", "action": "add 或 resolve"}}]}}
 
 规则:
 1. characters 只列本章有实质状态变化或新出场的人物;已知人物:{known_chars};
 2. foreshadowing:本章埋下新的钩子/悬念 → action=plant;本章回收了已有伏笔 → action=resolve(title 需与已有伏笔名一致,已有:{open_fores});
 3. plotlines:本章开启新故事线 → start;既有故事线有推进 → advance;故事线终结 → end;
-4. 若无变化,对应数组为空。
+4. reader_state 从「读者」视角记录(读者知道什么,而非角色知道什么):
+   - known:本章向读者揭示的关键事实(真相、秘密、身世、规则等)→ add;
+   - expect:本章结尾让读者产生的期待或悬念承诺 → add;
+   - mislead:本章刻意引导的误认(读者被引导相信、但与作者真相不符)→ add;
+   - 本章兑现了此前的期待,或揭穿了此前的误导 → action=resolve,content 填原条目内容;
+   - 与前文重复的认知不再记录。各数组无变化时为空。
 
 【正文】
 {content[:8000]}"""

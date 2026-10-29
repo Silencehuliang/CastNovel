@@ -182,6 +182,10 @@ _MOCK_STATE = {
     "plotlines": [
         {"title": "身世之谜线", "description": "(模拟)玉佩线索推进,指向旧宅", "action": "advance"},
     ],
+    "reader_state": [
+        {"kind": "known", "content": "(模拟)读者已知玉佩在雷雨夜发烫", "action": "add"},
+        {"kind": "expect", "content": "(模拟)读者期待玉佩认主之日的启程", "action": "add"},
+    ],
 }
 
 

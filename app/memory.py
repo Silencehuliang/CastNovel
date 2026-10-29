@@ -82,11 +82,12 @@ def hit_lore(lore, *texts, max_entries=8, entry_limit=400):
 
 
 def build_context(project, characters, chapters, foreshadowing, target_idx, settings,
-                  lore=None, query_vec=None, doc_vectors=None):
+                  lore=None, query_vec=None, doc_vectors=None, reader=None):
     """组装写第 target_idx 章时所需的上下文文本。
 
     lore: Lorebook 条目(关键词命中注入);
-    query_vec/doc_vectors: 可选向量语义检索(为空时自动用 BM25)。
+    query_vec/doc_vectors: 可选向量语义检索(为空时自动用 BM25);
+    reader: 读者认知状态(读者已知/期待/误认,与角色已知、作者真相分离)。
     """
     gen = settings.get("gen", {})
     world_limit = 2200
@@ -181,4 +182,33 @@ def build_context(project, characters, chapters, foreshadowing, target_idx, sett
         ]
         parts.append("【待回收伏笔(可在合适节点呼应,勿强行填坑)】\n" + "\n".join(lines))
 
+    # 读者认知状态:与角色已知、作者真相分离,防复述、管期待、控误导
+    reader_lines = _reader_block(reader)
+    if reader_lines:
+        parts.append(reader_lines)
+
     return "\n\n".join(parts)
+
+
+_READER_LABELS = {"known": "读者已知", "expect": "读者期待", "mislead": "读者误认"}
+
+
+def _reader_block(reader):
+    if not reader:
+        return ""
+    groups = {"known": [], "expect": [], "mislead": []}
+    for r in reader:
+        kind = r.get("kind") if r.get("kind") in groups else "known"
+        if r.get("status") == "open" and (r.get("content") or "").strip():
+            origin = f"(第{r['chapter_idx']}章起)" if r.get("chapter_idx") else ""
+            groups[kind].append(f"- {_clip(r['content'], 90)}{origin}")
+    lines = []
+    if groups["known"]:
+        lines.append("读者已知的事实(严禁当作悬念复述,可作共识直接引用):\n" + "\n".join(groups["known"][-8:]))
+    if groups["expect"]:
+        lines.append("读者正期待兑现的承诺(可延迟满足,不可无视遗忘):\n" + "\n".join(groups["expect"][-6:]))
+    if groups["mislead"]:
+        lines.append("读者被引导的误认(与作者真相不符;反转揭示前维持误导,勿提前泄底):\n" + "\n".join(groups["mislead"][-6:]))
+    if not lines:
+        return ""
+    return "【读者认知状态(与角色已知/作者真相分离)】\n" + "\n".join(lines)

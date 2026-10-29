@@ -514,6 +514,61 @@ def remove_lore(pid: int, lid: int):
     return {"ok": True}
 
 
+# ---------- 读者认知状态 ----------
+
+class ReaderIn(BaseModel):
+    kind: str = "known"
+    content: str
+    chapter_idx: int | None = None
+
+
+@router.get("/projects/{pid}/reader")
+def list_reader(pid: int):
+    return db.list_reader(pid)
+
+
+@router.post("/projects/{pid}/reader")
+def add_reader(pid: int, payload: ReaderIn):
+    if payload.kind not in db.READER_KINDS:
+        raise HTTPException(status_code=400, detail="kind 必须是 known/expect/mislead")
+    if not payload.content.strip():
+        raise HTTPException(status_code=400, detail="内容不能为空")
+    rid = db.run(
+        "INSERT INTO reader_state(project_id,kind,content,chapter_idx) VALUES(?,?,?,?)",
+        (pid, payload.kind, payload.content.strip(), payload.chapter_idx),
+    )
+    return {"id": rid}
+
+
+@router.put("/projects/{pid}/reader/{rid}")
+def patch_reader(pid: int, rid: int, payload: dict):
+    fields = {}
+    for k in ("kind", "content", "status", "chapter_idx"):
+        if k in payload and payload[k] is not None:
+            fields[k] = payload[k]
+    if fields.get("kind") not in (None,) and fields["kind"] not in db.READER_KINDS:
+        raise HTTPException(status_code=400, detail="kind 必须是 known/expect/mislead")
+    db.update_reader(rid, fields)
+    return {"ok": True}
+
+
+@router.delete("/projects/{pid}/reader/{rid}")
+def remove_reader(pid: int, rid: int):
+    db.delete_reader(rid)
+    return {"ok": True}
+
+
+# ---------- 门禁重算 ----------
+
+@router.post("/projects/{pid}/chapters/{cid}/gate")
+def regate(pid: int, cid: int):
+    """对章节当前正文重跑一致性门禁(零 token),刷新徽章。"""
+    try:
+        return stages.recompute_gate(pid, cid)
+    except Exception as e:
+        _err(e)
+
+
 # ---------- 情节线 ----------
 
 @router.put("/projects/{pid}/plotlines/{plid}")
