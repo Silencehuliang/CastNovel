@@ -32,11 +32,12 @@ python main.py          # 浏览器打开 http://127.0.0.1:8000
 
 ## 功能总览
 
-- **设定页**:梗概/文风(含风格预设)、**文风样本**、世界观生成、角色档案表(手工+AI)、伏笔登记簿、**情节线追踪**、**Lorebook 关键词触发设定**、**设定变更影响反查**、**读者认知状态**(已知/期待/误认)
+- **设定页**:梗概/文风(含风格预设)、**文风样本**、世界观生成、角色档案表(手工+AI)、伏笔登记簿、**情节线追踪**、**Lorebook 六字段触发设定**(主键/次键/逻辑/常驻/优先级,兼容 SillyTavern World Info 导入导出)、**设定变更影响反查**、**读者认知状态**(已知/期待/误认)
 - **大纲页**:一键生成全书章纲(卷+章+钩子),逐章标题/概要可编辑,手动增删章,**级联重生成**(改章纲后勾选下游章节批量重做,旧稿自动快照)
 - **写作页**:章纲节拍生成、**上下文透视**、正文流式生成、**候选拉样+主编重排**(2~4 选 1)、**一致性门禁徽章**(字数/人物覆盖/重复率)、去 AI 味润色、**两步去 AI 味(span 定位改写)**、**版本历史与回滚**、**批量连写**(可熔断)
-- **审校页**:评分卡(总分+四维)、带定位的问题清单、修改建议、按意见修订(预览→采用)、**独立盲审接入**(导出评分卡/回写结果,写评分离)、定稿(自动更新摘要+人物状态+伏笔+情节线)
+- **审校页**:评分卡(总分+四维)、带定位的问题清单、修改建议、按意见修订(预览→采用)、**独立盲审接入**(导出评分卡/回写结果,写评分离)、定稿(自动更新摘要+人物状态时间线+伏笔+情节线)
 - **导出页**:**EPUB**/TXT/Markdown/DOCX,txt 拆书导入,作品统计与模型用量
+- **发布页**:**番茄小说上传/同步**(ego-browser 驱动已登录的作家后台):绑定书籍 ID、拉取平台章节目录与章节 ID、逐章同步计划(新建/更新/跳过)、**同步单章或指定范围**、dry 预演、SSE 实时进度;平台驱动按注册表扩展,后续可接更多平台
 - **设置页**:**14 家供应商模板一键建档**(DeepSeek/GLM/Qwen/Kimi/Claude/Gemini/OpenAI/OpenRouter/硅基流动/火山方舟/MiniMax/Groq/Ollama/LM Studio)、「拉取模型列表」免猜模型名、多模型档案(名称/BaseURL/Key/模型/温度/max_tokens)、强/快/**Embedding** 模型指定、生成参数(章字数/上下文预算/摘要窗口/检索条数)、连接测试
 
 ## 架构
@@ -53,10 +54,13 @@ app/
   stages.py              流水线编排(生成/门禁/审校/修订/定稿/批量连写/候选拉样重排/级联/导入)
   routes.py              FastAPI 路由(生成类接口统一 SSE)
   export.py              TXT/Markdown/DOCX/EPUB 导出
+  publish.py             平台发布/同步:平台注册表、内容清洗、同步计划、映射落库
 tests/e2e_smoke.py       端到端冒烟测试(mock 离线全流程,47 步断言)
-mcp_server.py            MCP Server(stdio),把流水线暴露给 CodeBuddy / WorkBuddy(25 个工具)
+tests/test_publish.py    发布/同步单测(临时库 + 假驱动)
+mcp_server.py            MCP Server(stdio),把流水线暴露给 CodeBuddy / WorkBuddy(32 个工具)
 mcp.json                 MCP 客户端配置模板
 skills/castnovel/        Agent 技能包(SKILL.md + API 速查),tools/install_skill.py 一键安装
+tools/ego_fanqie.mjs     番茄作家后台驱动(ego-browser nodejs,list/create/update)
 tools/gemini_bridge.py   浏览器版 Gemini 桥接:把网页额度包成 OpenAI 兼容 API(免 API Key)
 ```
 
@@ -214,7 +218,7 @@ python tools/install_skill.py --remove      # 移除
 - **CodeBuddy**:侧边对话面板右上 **Settings → MCP → Add MCP**,粘贴上面的 JSON → 保存,状态变绿后点 **Try to Run** 验证。
 - **WorkBuddy**:侧栏 **插件 → 右上角 MCP 服务器 → 配置**,粘贴 JSON → 保存,状态 🟢 即成功;命令行版可用 `/mcp` 查看状态与诊断。
 
-#### 提供的工具(25 个)
+#### 提供的工具(32 个)
 
 | 分组 | 工具 |
 |---|---|
@@ -223,8 +227,9 @@ python tools/install_skill.py --remove      # 移除
 | 章节 | `generate_beats`、`generate_draft`、`generate_draft_best`(候选拉样重排)、`polish_chapter`、`deai_rewrite_chapter`(两步去 AI 味)、`review_chapter`、`finalize_chapter` |
 | 读写 | `read_chapter`、`update_chapter`、`export_novel` |
 | 盲审 | `export_review_prompt`、`submit_review` |
-| 设定维护 | `list_lore_entries`、`upsert_lore_entry`、`delete_lore_entry`、`search_impact`(影响反查) |
-| 读者认知/门禁 | `get_reader_state`、`edit_reader_state`、`run_gate_check`(零 token 门禁重算) |
+| 设定维护 | `list_lore_entries`、`upsert_lore_entry`、`delete_lore_entry`、`export_lorebook`、`import_lorebook`、`search_impact`(影响反查) |
+| 读者认知/门禁 | `get_reader_state`、`edit_reader_state`、`run_gate_check`(零 token 门禁重算)、`get_character_history` |
+| 平台发布 | `get_publish_status`(同步计划)、`set_publish_binding`、`pull_publish_mapping`(拉章节 ID)、`sync_to_platform`(单章/范围,可 dry) |
 
 ### 3. 对话示例
 
@@ -244,9 +249,10 @@ Agent 会依次调用 `list_projects` → `get_project_overview` → `generate_d
 # 必须带 CASTNOVEL_FORCE_MOCK:强制全流程离线,即使库里有真实 Key 也绝不消耗额度
 CASTNOVEL_FORCE_MOCK=1 python main.py 8901 &   # Windows CMD: set CASTNOVEL_FORCE_MOCK=1 再启动
 python tests/e2e_smoke.py http://127.0.0.1:8901
+python tests/test_publish.py                    # 发布/同步:临时库+假驱动,不启动浏览器
 ```
 
-测试以内置 mock 模型离线运行,47 步断言覆盖从建项到导出的全流程与 v0.3 新特性(Lorebook 注入、影响反查、候选重排、两步去 AI 味、级联重生成、向量检索路径),不消耗任何 API 额度。
+测试以内置 mock 模型离线运行,47 步断言覆盖从建项到导出的全流程与 v0.3 新特性(Lorebook 注入、影响反查、候选重排、两步去 AI 味、级联重生成、向量检索路径),不消耗任何 API 额度。另有 `python tests/test_lorebook.py`,用临时库验证六字段持久化、常驻/次键/逻辑过滤与 SillyTavern 往返导入导出。
 
 ## Roadmap
 
@@ -258,6 +264,11 @@ python tests/e2e_smoke.py http://127.0.0.1:8901
 - [x] v0.3:可选向量语义检索(配置 Embedding 档案自动启用,异常回退 BM25)
 - [x] v0.3:14 家供应商模板一键接入 + 模型列表拉取 + Agent 技能包(WorkBuddy/CodeBuddy)
 - [x] v0.4:读者认知状态(读者已知/期待/误认,与作者真相分离;定稿自动抽取,生成时注入防复述/管期待/控误导)+ 门禁重算(编辑/采用后徽章即时刷新)
+- [x] v0.5:Lorebook 六字段(主键/次键/AND-ANY|ALL/NOT-ANY|ALL/常驻/优先级)+ SillyTavern World Info JSON 导入导出
+- [x] v0.5:角色状态时间线(定稿抽取、按章回放、生成时注入「第 N 章时状态」)
+- [x] v0.5:BM25/向量检索时近加权(越新的章节越相关)
+- [x] v0.5:番茄发布工具链(浏览器驱动、章节映射、按范围同步;API/MCP/发布页已接入,已拉取第 1-24 章映射;真实同步待验证)
+- [x] v0.5:平台发布/同步(番茄先行):章节映射、逐章计划、单章/范围同步、dry 预演、SSE 进度;Web 发布页 + MCP 工具
 
 ## License
 

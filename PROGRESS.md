@@ -42,10 +42,9 @@
 | `tools/ego_gemini_bridge.mjs` | **方案 A 核心**：ego-browser 驱动 Ego Lite 已登录 Gemini 网页版对话。读 `data/gemini_task/prompt.txt`（+可选 `model.txt`），写 `data/gemini_task/reply.txt`。运行：`ego-browser nodejs < tools/ego_gemini_bridge.mjs` |
 | `tools/apply_revision.py <N>` | 把 Gemini 修订稿（reply.txt）清洗后覆盖 `data/rewrite/chNN.md`（补 `# 第N章` 标题行、字数校验），之后跑 `tools/write_chapter.py <N>` 过门禁 |
 | `tools/export_chapters.py <lo> <hi>` | 导出纯文本到 `data/upload/` |
-| `tools/cdp.py` | CDP 代理客户端（eval/click/clickAt/navigate/screenshot/targets/close） |
-| `tools/upload_volume.py <listTab> <lo> <hi>` | 批量新建章节并上传番茄 |
-| `tools/upload_chapter.py <target> <N> <chapterId>` | 覆盖番茄上已存在章节 |
-| `tools/delete_chapter.py <listTab> <N...>` | 删除番茄章节 |
+| `app/publish.py` + Web「发布」页 | **平台发布/同步（v0.5）**：绑定书籍、拉取映射、单章/范围同步、dry 预演、SSE 进度 |
+| `tools/ego_fanqie.mjs` | 番茄驱动（ego-browser；action=list/create/update，读 `data/publish_task/task.json` 写 result.json） |
+| `tools/cdp.py`、`upload_volume.py`、`upload_chapter.py`、`delete_chapter.py` | 旧 CDP 代理方案（保留备用，新流程走 `ego_fanqie.mjs`） |
 
 ## 四、盲评流程（必须遵守）
 
@@ -58,7 +57,7 @@
 3. 按 issues 全量落实后重跑盲评，直到 ≥85
 4. **批量盲评一次 5 章**（一个 agent 调用审 5 章），比逐章省 5 倍往返
 
-## 五、盲评分数轨迹
+## 五、盲评分数轨迹（旧记录：首轮分数，最新以第四节进度表为准）
 
 盲评结果已按章存档为 `data/rewrite/chNN.blind.json`（`tools/save_blind.py` 从 task 输出自动解析）。
 
@@ -86,9 +85,9 @@
 4. 复评已修的 1、3、4 章
 4. 35 章全部 ≥85 后：
    - `tools/export_chapters.py 1 24` 重新导出（正文已清 `---`）
-   - 抓番茄 24 个章节 ID 映射，写「更新已发布章节」脚本（走编辑页 → 粘贴 → 下一步 → 提交 → 选否 → 确认提交）
-   - 同步第一、二卷
-   - 第三卷 25-36 章写完后用 `tools/upload_volume.py` 上传
+   - ~~抓番茄 24 个章节 ID 映射~~ **已完成（2026-10-29，24 章真实 ID 已写入 `publish_map`）**
+   - 在 Web「发布」页选范围同步第一、二卷（先勾「只预演」，确认后真同步）
+   - 第三卷 25-36 章写完后用「发布」页新建（create）上传
 5. 番茄上传注意事项：
    - 新建章节会**新开标签页**，在列表页点「新建章节」（span 的父级 button）
    - 发布设置里选「否」（**弹窗内 input[type=radio] value="2"**，value=1 是「是」；必须点 label，直接改 checked 无效）
@@ -102,7 +101,7 @@
 
 ## 八、代码库注意事项
 
-- MCP server(`mcp_server.py`)v0.3 共 **22 个工具**(新增 `generate_draft_best` 候选拉样重排、`deai_rewrite_chapter` 两步去AI味、`search_impact` 影响反查、`list/upsert/delete_lore_entry` Lorebook);CodeBuddy 侧需**重启 castnovel server** 才能看到新工具
+- MCP server(`mcp_server.py`)当前共 **32 个工具**;v0.4 已提交,v0.5 工作区未提交内容:Lorebook 六字段(ST 导入导出)、角色状态时间线(`get_character_history`)、检索时近加权、番茄发布(`get_publish_status`/`set_publish_binding`/`pull_publish_mapping`/`sync_to_platform`)。Lorebook 导入导出逻辑在 `app/stages.py`(routes 与 MCP 共用,勿再内联)。CodeBuddy 侧需**重启 castnovel server** 才能看到新工具
 - 测试务必用 `CASTNOVEL_FORCE_MOCK=1 python main.py <port>` 启动(强制离线,库里配了真实 Key 也不会烧额度);本机 `data/novelforge.db` 的 strong/fast 档案是「discovery」真实模型
 - `app/stages.py` 有私有函数 `_ctx_parts(pid, idx, settings)` 返回第 4 项即 context(已含 Lorebook 注入与可选向量检索)
 - `db.update_chapter` 的 allowed 字段:idx/title/beats/summary/content/status/review/gate
@@ -132,35 +131,54 @@
 4. **复评**：新一轮盲评 agent（全新、无历史）→ 回到 1
 5. 每批完成更新下表与「五、盲评分数轨迹」
 
-**进度表（前两卷 1-24 章）**：评 = 最新一轮盲审分。达标线 ≥85。
+**进度表（前两卷 1-24 章）**：评 = 最新盲审分。达标线 ≥85。**2026-10-29 最新：达标 5/24（1/2/3/6/7）；4=79、5=80、8=73；9-12 已修待三评；13-24 已修待二评。**
 
-| 章 | 首评 | 复评 | 状态 |
-|---|---|---|---|
-| 1 | 84 | 87 | ✅ 达标 |
-| 2 | 82 | 83 | 按复评意见再修(椅子距离矛盾/称谓体例/楼规来源) |
-| 3 | 85 | 84 | 按复评意见修(陆铮人称/体能跳变/宴期口径) |
-| 4 | 79 | 82 | 按复评意见再修(铜牌来历/宴期时间线) |
-| 5 | 84 | 83 | 按复评意见再修(青黛视角滑移/三更衔接) |
-| 6 | 86 | - | ✅ 达标 |
-| 7 | 85 | - | ✅ 达标 |
-| 8 | 83 | 82 | 按复评意见再修(翻译腔对白/女性人称) |
-| 9 | 78 | 83 | 按复评意见再修(500 两账目/人称/结尾复述) |
-| 10 | 79 | 84 | 按复评意见再修(归类句主宾颠倒/落帕动机) |
-| 11 | 76 | 79 | **高危:与第 8 章死亡时间冲突**;の字/素心台词重复 |
-| 12 | 77 | 84 | 按复评意见再修(薄瓷警报矛盾/皂靴脚印表述) |
-| 13 | 82 | - | 已修(4 轮),门禁 PASS,待复评 |
-| 14 | 84 | - | 修订 prompt 已生成,等浏览器 |
-| 15 | 83 | - | 待修,等浏览器 |
-| 16 | 79 | - | 待修,等浏览器 |
-| 17 | 84 | - | 待修,等浏览器 |
-| 18 | 83 | - | 待修,等浏览器 |
-| 19 | 84 | - | 待修,等浏览器 |
-| 20 | 78 | - | 待修,等浏览器 |
-| 21 | 84 | - | 待修,等浏览器 |
-| 22 | 82 | - | 待修,等浏览器 |
-| 23 | 79 | - | 待修,等浏览器 |
-| 24 | 78 | - | 待修,等浏览器 |
+| 章 | 首评 | 二评 | 三评 | 最新动作 / 状态 |
+|---|---|---|---|---|
+| 1 | 84 | 87 | - | ✅ 达标 |
+| 2 | 82 | 83 | 85 | ✅ 达标（三评） |
+| 3 | 85 | 84 | 86 | ✅ 达标（三评） |
+| 4 | 79 | 82 | 79 | 三评 15 条待修（1 高危：铜牌来历） |
+| 5 | 84 | 83 | 80 | 三评 16 条待修（0 高危） |
+| 6 | 86 | - | - | ✅ 达标 |
+| 7 | 85 | - | - | ✅ 达标 |
+| 8 | 83 | 82 | 73 | 已按三评修 1 轮、门禁 PASS；复评仍有 3 高危（照明/对白/绿珠），第二轮 prompt 已就绪 |
+| 9 | 78 | 83 | 待 | 二评意见已修，待三评 |
+| 10 | 79 | 84 | 待 | 二评意见已修，待三评 |
+| 11 | 76 | 79 | 待 | 二评意见已修，待三评 |
+| 12 | 77 | 84 | 待 | 二评意见已修，待三评 |
+| 13 | 82 | 待 | - | 已修（4 轮），待二评 |
+| 14 | 84 | 待 | - | 已修（5 轮），待二评 |
+| 15 | 83 | 待 | - | 已修（人称 3 条+形态改造），待二评 |
+| 16 | 79 | 待 | - | 已修（人称+形态改造），待二评 |
+| 17 | 84 | 待 | - | 已修（2 轮），待二评 |
+| 18 | 83 | 待 | - | 已修（3 轮），待二评 |
+| 19 | 84 | 待 | - | 已修（3 轮），待二评 |
+| 20 | 78 | 待 | - | 已修（人称+形态改造），待二评 |
+| 21 | 84 | 待 | - | 已修（机械替换+形态改造+台词转叙述），待二评 |
+| 22 | 82 | 待 | - | 已修（3 轮，3.1 Pro），待二评 |
+| 23 | 79 | 待 | - | 已修（2 轮形态改造），待二评 |
+| 24 | 78 | 待 | - | 已修（人称+茶钱+形态改造），待二评 |
 
-**当前阻塞(2026-10-28):用户正在 Ego Lite 浏览器上使用 Gemini(goto /app 被重定向到营销页,三个 tab 均被占用),桥接礼让暂停。用户空下来后对每章执行:python tools/make_revision_prompt.py <N> && ego-browser nodejs < tools/ego_gemini_bridge.mjs && python tools/apply_revision.py <N> && python tools/write_chapter.py <N>;门禁 FAIL 时提取门禁细节并入 chNN.blind.json 重修;修完发新一轮盲评 agent(5 章一批)复评,循环至 ≥85。**
+**当前状态（2026-10-29）：**
+- 代码侧：MCP `export_lorebook` / `import_lorebook` 断点已修复（逻辑抽到 `app/stages.py`，routes/MCP 共用；新增 `tests/test_lorebook.py`，临时库验证六字段、常驻条目、AND/ALL 过滤与 ST 往返）。另修复常驻条目主键同时命中时的重复注入。
+- 发布侧：`app/publish.py` + `tools/ego_fanqie.mjs` 已接入 REST/MCP/发布页；`tests/test_publish.py` 通过（临时库+假驱动）；已成功拉取第 1-24 章平台映射（24 条均有章节 ID），**真实平台同步尚未执行**。新项目空映射时直接 sync 仍会把已发布章节当新章，务必先「拉取平台映射」。
+- 小说侧：第 8 章第一轮修订已落盘并过门禁（2724 字，对话密度全 PASS），但复评 73（3 高危）；第二轮修订 prompt 已生成在 `data/gemini_task/prompt.txt`。
+- **阻塞：Ego 桥接失败（p4 unavailable / chrome-error，疑似浏览器被占用或页面加载失败）。** 浏览器恢复后按顺序执行：
+  1. 第 8 章第二轮：`ego-browser nodejs < tools/ego_gemini_bridge.mjs` → `python tools/apply_revision.py 8` → `python tools/write_chapter.py 8` → 复评；
+  2. 第 4、5 章：`python tools/make_revision_prompt.py <N>`（需先按三评 issues 补具体改法）→ 同样跑桥接/落盘/门禁 → 复评；
+  3. 8/4/5 达标后，继续 9-12 三评、13-24 二评；
+  4. 全部 ≥85 后再做番茄映射与同步。
 
 桥接工程备忘:Gemini 会把 ASCII 引号写成中文弯引号(apply_revision 已归一化 U+201C/201D→");拒答(「爱莫能助」)在 prompt 模板加【背景说明】虚构声明后解决;用户占用浏览器时 goto /app 被重定向到营销页(检测到即礼让);短应答门禁顽固章用「叙述引导+原话保留」形态改造有效;11 章修订曾引入与 8 章的跨章死亡时间矛盾(批量盲评 8-12 时发现)——跨章一致性依赖批量盲评暴露。
+
+## 十、平台发布/同步（v0.5，2026-10-29 落地）
+
+- 代码：`app/publish.py`（平台注册表/清洗/计划/映射/编排）、`app/routes.py` 的 `/projects/{pid}/publish*`、Web「发布」页、`tools/ego_fanqie.mjs`、MCP 工具 `get_publish_status/set_publish_binding/pull_publish_mapping/sync_to_platform`、单测 `tests/test_publish.py`
+- 驱动修复：`waitListRows` 未定义、重复 `scrapeAllPages`、空分卷导致整次 list 超时、编辑页同页跳转取不到章节 ID；list 现按分卷容错并返回 warnings
+- 真机状态：作品 18 已绑定番茄 `book_id=7701211068684569625`；`publish_map` 已拉取 **24 章真实章节 ID**（status=mapped，content_hash 为空）
+- 当前计划：更新 24（1-24，首次同步覆盖）/ 新建 11（25-35）/ 跳过 25（36-60 正文为空）
+- **真实验证（2026-10-29 10:07，已获作者确认）**：第 1 章真实同步成功；重新打开平台编辑页核对，正文与本地修订稿**逐字一致**（忽略空白）。番茄列表字数/发布时间延迟不刷新（仍显示 3801 / 10-27），不能作为判据
+- 驱动加固：更新前必须等标题/章节号/正文载入（空壳自动 reload 一次）；章节号不一致直接失败；dry 标题不一致判失败；提交后发布弹窗未关闭即 `SUBMIT_UNVERIFIED`；「已保存」未确认也失败
+- 未做：1-24 其余章节真实同步（等作者确认）；25-35 新建上传
+- 注意：拉映射后首次同步会把范围内已映射章节全部覆盖为本地正文；只想同步改动章时，先看发布页计划表或用 `get_publish_status` 确认

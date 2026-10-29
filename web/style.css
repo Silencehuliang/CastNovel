@@ -124,6 +124,9 @@ label.fld { display: block; font-size: 12px; color: var(--ink-soft); margin: 10p
 .badge.b-final { color: var(--accent); border-color: #e5c4c0; background: #faeeec; }
 .badge.b-open { color: var(--gold); border-color: #e2d29a; background: #faf5e4; }
 .badge.b-resolved { color: var(--green); border-color: #bfdccd; background: #eef7f1; }
+.badge.b-create { color: var(--blue); border-color: #c4d6e8; background: #eef4fa; }
+.badge.b-update { color: var(--accent); border-color: #e5c4c0; background: #faeeec; }
+.badge.b-skip { color: var(--ink-soft); }
 .badge.b-高 { color: var(--accent); border-color: #e5c4c0; background: #faeeec; }
 .badge.b-中 { color: var(--gold); border-color: #e2d29a; background: #faf5e4; }
 .badge.b-低 { color: var(--ink-soft); }
@@ -134,6 +137,13 @@ table.tbl th { color: var(--ink-soft); font-weight: 600; font-size: 12px; backgr
 table.tbl input, table.tbl textarea { border-color: transparent; background: transparent; padding: 4px 6px; }
 table.tbl input:hover, table.tbl textarea:hover { border-color: var(--line); }
 table.tbl input:focus, table.tbl textarea:focus { border-color: var(--gold); background: #fff; }
+table.tbl.pub-plan { table-layout: fixed; }
+table.tbl.pub-plan th:nth-child(1), table.tbl.pub-plan td:nth-child(1) { width: 46px; }
+table.tbl.pub-plan th:nth-child(3), table.tbl.pub-plan td:nth-child(3),
+table.tbl.pub-plan th:nth-child(4), table.tbl.pub-plan td:nth-child(4) { width: 78px; }
+table.tbl.pub-plan th:nth-child(5), table.tbl.pub-plan td:nth-child(5) { width: 72px; }
+table.tbl.pub-plan th:nth-child(7), table.tbl.pub-plan td:nth-child(7) { width: 108px; }
+table.tbl.pub-plan td:nth-child(2), table.tbl.pub-plan td:nth-child(6) { overflow-wrap: anywhere; }
 
 details.ctx { margin-top: 10px; }
 details.ctx summary { cursor: pointer; font-size: 12.5px; color: var(--blue); }

@@ -10,7 +10,7 @@ import re
 from app import db, prompts
 from app.config import find_profile, load_settings, resolve_profile
 from app.llm import chat, embed, extract_json
-from app.memory import build_context
+from app.memory import build_context_report
 from app.lint import lint_spans, lint_text
 
 
@@ -25,6 +25,90 @@ def _chat(pid, stage, profile, messages, on_delta=None, json_mode=False):
     text = chat(profile, messages, json_mode=json_mode, on_delta=on_delta)
     db.add_usage(pid, stage, len(json.dumps(messages, ensure_ascii=False)), len(text))
     return text
+
+
+# ---------- Lorebook 兼容引擎(ST World Info 导入导出) ----------
+
+_LORE_LOGIC_TO_ST = {"and_any": 0, "not_all": 1, "not_any": 2, "and_all": 3}
+_LORE_LOGIC_FROM_ST = {v: k for k, v in _LORE_LOGIC_TO_ST.items()}
+
+
+def _split_keys(raw):
+    if isinstance(raw, list):
+        return ", ".join(str(k).strip() for k in raw if str(k).strip())
+    return str(raw or "").strip()
+
+
+def export_lore(pid):
+    """导出为 SillyTavern World Info JSON(可直接导入 ST / NovelAI 生态)。"""
+    _load(pid)
+    entries = {}
+    for i, r in enumerate(db.list_lore(pid)):
+        secondary = (r.get("secondary") or "").strip()
+        entries[str(i)] = {
+            "uid": i,
+            "key": [k.strip() for k in re.split(r"[,，、;；\s]+", r["keywords"] or "") if k.strip()],
+            "keysecondary": [k.strip() for k in re.split(r"[,，、;；\s]+", secondary) if k.strip()],
+            "comment": r.get("note") or "",
+            "content": r["content"],
+            "constant": bool(r.get("constant")),
+            "selective": bool(secondary),
+            "selectiveLogic": _LORE_LOGIC_TO_ST.get(r.get("logic") or "and_any", 0),
+            "order": int(r.get("priority") or 0) + 100,
+            "position": 0,
+            "disable": not r.get("enabled"),
+            "addMemo": True,
+            "displayIndex": i,
+        }
+    return {"name": "castnovel-lorebook", "entries": entries}
+
+
+def import_lore(pid, data):
+    """导入 SillyTavern World Info JSON(merge,不清空现有条目),返回导入条数。
+
+    兼容 ST 完整格式({entries:{...}})、本项目导出格式与简表 [{key,content,...}]。
+    常驻条目(constant)允许无主键;格式非法时抛 ValueError。
+    """
+    _load(pid)
+    raw = []
+    if isinstance(data, dict) and isinstance(data.get("entries"), dict):
+        raw = list(data["entries"].values())
+    elif isinstance(data, list):
+        raw = data
+    elif isinstance(data, dict) and data.get("content"):
+        raw = [data]
+    if not raw:
+        raise ValueError("未识别的格式:需要 SillyTavern World Info JSON(entries 字段)或条目数组")
+    n = 0
+    for e in raw:
+        if not isinstance(e, dict):
+            continue
+        content = str(e.get("content") or "").strip()
+        keys = _split_keys(e.get("key") or e.get("keys") or e.get("keywords"))
+        constant = 1 if e.get("constant") else 0
+        if not content or (not keys and not constant):
+            continue
+        logic = e.get("logic")
+        if logic not in _LORE_LOGIC_TO_ST:
+            try:
+                sel = int(e.get("selectiveLogic") or 0)
+            except (TypeError, ValueError):
+                sel = 0
+            logic = _LORE_LOGIC_FROM_ST.get(sel, "and_any")
+        try:
+            priority = max(0, min(999, int(e.get("order")) - 100)) if e.get("order") is not None else 0
+        except (TypeError, ValueError):
+            priority = 0
+        db.add_lore(
+            pid, keys, content, _split_keys(e.get("comment") or e.get("note")),
+            secondary=_split_keys(e.get("keysecondary") or e.get("secondary")),
+            logic=logic, constant=constant, priority=priority,
+            enabled=0 if e.get("disable") else 1,
+        )
+        n += 1
+    if not n:
+        raise ValueError("导入文件里没有可用条目(缺少 content,或既无 key 也非 constant)")
+    return n
 
 
 # ---------- 程序化一致性门禁(不依赖模型自觉,借鉴 wfcz10086/天命) ----------
@@ -76,17 +160,29 @@ def run_gate(settings, project, chapters, characters, chapter):
     }
 
 
-def _ctx_parts(pid, target_idx, settings):
+def _ctx_bundle(pid, target_idx, settings):
     project = _load(pid)
     characters = db.list_characters(pid)
     chapters = db.list_chapters(pid)
     fores = db.list_foreshadowing(pid)
     lore = db.list_lore(pid, only_enabled=True)
     reader = db.list_reader(pid)
+    char_states = db.list_character_states(pid)
     qvec, dvecs = _vector_aux(pid, chapters, target_idx, settings)
-    context = build_context(project, characters, chapters, fores, target_idx, settings,
-                            lore=lore, query_vec=qvec, doc_vectors=dvecs, reader=reader)
-    return project, characters, chapters, context
+    context, report = build_context_report(
+        project, characters, chapters, fores, target_idx, settings,
+        lore=lore, query_vec=qvec, doc_vectors=dvecs, reader=reader,
+        char_states=char_states,
+    )
+    return {
+        "project": project, "characters": characters, "chapters": chapters,
+        "context": context, "report": report,
+    }
+
+
+def _ctx_parts(pid, target_idx, settings):
+    bundle = _ctx_bundle(pid, target_idx, settings)
+    return bundle["project"], bundle["characters"], bundle["chapters"], bundle["context"]
 
 
 def _vector_aux(pid, chapters, target_idx, settings):
@@ -438,8 +534,305 @@ def revise_chapter(pid, cid, on_delta=None):
     return text
 
 
+_STATE_ACTION_ALIASES = {
+    "foreshadowing": {
+        "plant": "plant", "planted": "plant", "埋设": "plant", "埋下": "plant",
+        "resolve": "resolve", "resolved": "resolve", "payoff": "resolve", "回收": "resolve", "兑现": "resolve",
+    },
+    "plotlines": {
+        "start": "start", "begin": "start", "开启": "start",
+        "advance": "advance", "advancing": "advance", "progress": "advance", "推进": "advance",
+        "end": "end", "finish": "end", "conclude": "end", "结束": "end", "收束": "end",
+    },
+    "reader_state": {
+        "add": "add", "new": "add", "新增": "add",
+        "resolve": "resolve", "resolved": "resolve", "done": "resolve", "close": "resolve",
+        "结算": "resolve", "兑现": "resolve", "揭穿": "resolve",
+    },
+}
+_READER_KIND_ALIASES = {
+    "known": "known", "已知": "known",
+    "expect": "expect", "期待": "expect",
+    "mislead": "mislead", "误认": "mislead", "误导": "mislead",
+}
+_DEAD_MARKERS = ("已死", "身亡", "阵亡", "殒命", "死亡", "断气", "气绝", "死了")
+_REVIVAL_MARKERS = ("复活", "重生", "诈死", "假死", "未死", "没死", "救活", "苏醒", "醒来", "死而复生", "死里逃生", "逃过一死")
+
+
+def _norm_action(raw, mapping, default):
+    s = str(raw or "").strip().lower()
+    if not s:
+        return default
+    return mapping.get(s, s)
+
+
+def _clip_state(value, limit):
+    s = str(value or "").strip()
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
+def _status_at_or_before(states, name, idx, fallback=""):
+    evs = [
+        e for e in (states or [])
+        if e.get("name") == name and int(e.get("chapter_idx") or 0) <= idx
+    ]
+    if not evs:
+        return fallback
+    return max(evs, key=lambda e: (int(e["chapter_idx"]), int(e.get("id") or 0))).get("status") or fallback
+
+
+def _is_dead_status(status):
+    s = str(status or "")
+    if any(m in s for m in _REVIVAL_MARKERS):
+        return False
+    return any(m in s for m in _DEAD_MARKERS)
+
+
+def _validate_state(state, characters, foreshadowing, plotlines, reader, chapter_idx, chapters, char_states):
+    """定稿状态确定性校验:normalize 动作别名、去重、检查角色/章节/schema/状态回退。
+
+    结构性或高风险错误直接抛 ValueError(调用方不落库);可修复问题写入 validation.fixes。
+    """
+    errors, warnings, fixes = [], [], []
+    if not isinstance(state, dict):
+        raise ValueError("定稿状态校验失败:模型返回的不是 JSON 对象")
+    if not isinstance(chapter_idx, int) or chapter_idx < 1:
+        errors.append(f"章节号非法:{chapter_idx}")
+    max_idx = max((int(ch.get("idx") or 0) for ch in chapters), default=0)
+    if max_idx and isinstance(chapter_idx, int) and chapter_idx > max_idx:
+        errors.append(f"章节号 {chapter_idx} 超出当前最大章节 {max_idx}")
+
+    def section(key):
+        val = state.get(key, [])
+        if val is None:
+            return []
+        if not isinstance(val, list):
+            errors.append(f"{key} 必须是数组")
+            return []
+        return val
+
+    known = {c["name"] for c in characters if c.get("name")}
+    current = {c["name"]: c for c in characters if c.get("name")}
+
+    char_out, seen_char = [], {}
+    for i, c in enumerate(section("characters")):
+        if not isinstance(c, dict):
+            errors.append(f"characters[{i}] 必须是对象")
+            continue
+        name = str(c.get("name") or "").strip()
+        if not name:
+            errors.append(f"characters[{i}] 缺少 name")
+            continue
+        if len(name) > 30 or "\n" in name or "\r" in name:
+            errors.append(f"角色名「{name[:30]}」非法(过长或含换行)")
+            continue
+        role = _clip_state(c.get("role"), 20)
+        profile = _clip_state(c.get("profile"), 240)
+        status = _clip_state(c.get("status"), 120)
+        if len(str(c.get("profile") or "")) > 240:
+            fixes.append(f"角色「{name}」profile 超长,已截断")
+        if len(str(c.get("status") or "")) > 120:
+            fixes.append(f"角色「{name}」status 超长,已截断")
+        if name not in known and not profile:
+            profile = role or "新出场角色"
+            fixes.append(f"新角色「{name}」缺少 profile,已补默认值")
+        if name in seen_char:
+            prev = seen_char[name]
+            prev["role"] = role or prev["role"]
+            prev["profile"] = profile or prev["profile"]
+            prev["status"] = status or prev["status"]
+            fixes.append(f"角色「{name}」重复,已合并")
+            continue
+        item = {"name": name, "role": role, "profile": profile, "status": status}
+        seen_char[name] = item
+        char_out.append(item)
+
+    for c in char_out:
+        name, status = c["name"], c["status"]
+        if not status:
+            continue
+        prior = _status_at_or_before(char_states, name, chapter_idx, (current.get(name) or {}).get("status", ""))
+        if _is_dead_status(prior) and not _is_dead_status(status) and not any(m in status for m in _REVIVAL_MARKERS):
+            errors.append(
+                f"角色「{name}」状态从「{_clip_state(prior, 40)}」回退为「{_clip_state(status, 40)}」;"
+                "若为复活/诈死,请在 status 中写明"
+            )
+        latest = max(
+            (int(s.get("chapter_idx") or 0) for s in char_states if s.get("name") == name),
+            default=None,
+        )
+        if latest is not None and chapter_idx < latest:
+            warnings.append(
+                f"角色「{name}」已有第{latest}章状态;本次重定稿第{chapter_idx}章只追加时间线,不会回退当前档案状态"
+            )
+
+    fores_out, seen_fores = [], {}
+    all_titles = {f["title"] for f in foreshadowing}
+    for i, f in enumerate(section("foreshadowing")):
+        if not isinstance(f, dict):
+            errors.append(f"foreshadowing[{i}] 必须是对象")
+            continue
+        title = str(f.get("title") or "").strip()
+        if not title:
+            errors.append(f"foreshadowing[{i}] 缺少 title")
+            continue
+        if len(title) > 30:
+            errors.append(f"伏笔标题「{title[:30]}」过长")
+            continue
+        action = _norm_action(f.get("action"), _STATE_ACTION_ALIASES["foreshadowing"], "plant")
+        if action not in ("plant", "resolve"):
+            errors.append(f"伏笔「{title}」action 非法:{f.get('action')}")
+            continue
+        desc = _clip_state(f.get("description"), 200)
+        if len(str(f.get("description") or "")) > 200:
+            fixes.append(f"伏笔「{title}」description 超长,已截断")
+        if action == "resolve" and title not in all_titles:
+            warnings.append(f"伏笔「{title}」resolve 未匹配已有条目,将被跳过")
+        if title in seen_fores:
+            prev = seen_fores[title]
+            if action == "resolve":
+                prev["action"] = "resolve"
+            prev["description"] = desc or prev["description"]
+            fixes.append(f"伏笔「{title}」重复,已合并")
+            continue
+        item = {"title": title, "description": desc, "action": action}
+        seen_fores[title] = item
+        fores_out.append(item)
+
+    plot_out, seen_plot = [], {}
+    plot_titles = {p["title"] for p in plotlines}
+    for i, p in enumerate(section("plotlines")):
+        if not isinstance(p, dict):
+            errors.append(f"plotlines[{i}] 必须是对象")
+            continue
+        title = str(p.get("title") or "").strip()
+        if not title:
+            errors.append(f"plotlines[{i}] 缺少 title")
+            continue
+        if len(title) > 30:
+            errors.append(f"情节线标题「{title[:30]}」过长")
+            continue
+        action = _norm_action(p.get("action"), _STATE_ACTION_ALIASES["plotlines"], "start")
+        if action not in ("start", "advance", "end"):
+            errors.append(f"情节线「{title}」action 非法:{p.get('action')}")
+            continue
+        desc = _clip_state(p.get("description"), 200)
+        if len(str(p.get("description") or "")) > 200:
+            fixes.append(f"情节线「{title}」description 超长,已截断")
+        if action in ("advance", "end") and title not in plot_titles:
+            warnings.append(
+                f"情节线「{title}」{action} 未匹配已有条目"
+                + ("，将被跳过" if action == "end" else "，将新建")
+            )
+        if title in seen_plot:
+            prev = seen_plot[title]
+            if {"start": 1, "advance": 2, "end": 3}[action] >= {"start": 1, "advance": 2, "end": 3}[prev["action"]]:
+                prev["action"] = action
+            prev["description"] = desc or prev["description"]
+            fixes.append(f"情节线「{title}」重复,已合并")
+            continue
+        item = {"title": title, "description": desc, "action": action}
+        seen_plot[title] = item
+        plot_out.append(item)
+
+    reader_out, seen_reader = [], {}
+    open_reader = [(r.get("kind"), r.get("content") or "") for r in reader if r.get("status") == "open"]
+    for i, r in enumerate(section("reader_state")):
+        if not isinstance(r, dict):
+            errors.append(f"reader_state[{i}] 必须是对象")
+            continue
+        kind_raw = str(r.get("kind") or "known").strip().lower()
+        kind = _READER_KIND_ALIASES.get(kind_raw, kind_raw)
+        if kind not in ("known", "expect", "mislead"):
+            errors.append(f"reader_state[{i}] kind 非法:{r.get('kind')}")
+            continue
+        content = _clip_state(r.get("content"), 120)
+        if not content:
+            warnings.append(f"reader_state[{i}] 内容为空,已跳过")
+            continue
+        if len(str(r.get("content") or "")) > 120:
+            fixes.append("reader_state 内容超长,已截断")
+        action = _norm_action(r.get("action"), _STATE_ACTION_ALIASES["reader_state"], "add")
+        if action not in ("add", "resolve"):
+            errors.append(f"reader_state[{i}] action 非法:{r.get('action')}")
+            continue
+        if action == "resolve" and not any(
+            k == kind and (content in c or c in content) for k, c in open_reader
+        ):
+            warnings.append(f"读者认知「{content}」resolve 未匹配未结条目,将被跳过")
+        key = (kind, content)
+        if key in seen_reader:
+            if action == "resolve":
+                seen_reader[key]["action"] = "resolve"
+            fixes.append("reader_state 重复条目,已合并")
+            continue
+        item = {"kind": kind, "content": content, "action": action}
+        seen_reader[key] = item
+        reader_out.append(item)
+
+    if errors:
+        more = " 等" if len(errors) > 8 else ""
+        raise ValueError("定稿状态校验失败:" + "; ".join(errors[:8]) + more)
+
+    clean = {
+        "characters": char_out,
+        "foreshadowing": fores_out,
+        "plotlines": plot_out,
+        "reader_state": reader_out,
+    }
+    validation = {
+        "errors": [],
+        "warnings": warnings[:50],
+        "fixes": fixes[:50],
+        "counts": {k: len(v) for k, v in clean.items()},
+    }
+    return clean, validation
+
+
+def _snap_character(row):
+    return {k: row.get(k) for k in ("name", "role", "profile", "status")} if row else None
+
+
+def _snap_character_state(row):
+    return {k: row.get(k) for k in ("name", "chapter_idx", "status")} if row else None
+
+
+def _snap_foreshadow(row):
+    return {k: row.get(k) for k in ("title", "description", "planted_ch", "payoff_ch", "status")} if row else None
+
+
+def _snap_plotline(row):
+    return {k: row.get(k) for k in ("title", "description", "start_ch", "last_ch", "status")} if row else None
+
+
+def _snap_reader(row):
+    return {k: row.get(k) for k in ("kind", "content", "chapter_idx", "status")} if row else None
+
+
+def _snap_chapter(row):
+    return {k: row.get(k) for k in ("idx", "title", "status", "summary")} if row else None
+
+
+def _log_memory_result(pid, idx, entity, result, snap):
+    if not result or result.get("action") in (None, "noop"):
+        return
+    action = result["action"]
+    after = snap(result.get("after"))
+    if action == "skipped":
+        after = {"reason": result.get("reason")}
+    db.add_memory_event(
+        pid, idx, entity, action,
+        before=snap(result.get("before")), after=after,
+        status="skipped" if action == "skipped" else "applied",
+        entity_id=result.get("id"),
+    )
+
+
 def finalize_chapter(pid, cid):
-    """定稿:用快模型生成摘要 + 抽取人物状态与伏笔变化,写入故事圣经。"""
+    """定稿:快模型生成摘要 + 抽取状态 JSON → 确定性校验 → 单事务回写故事圣经。
+
+    校验失败不落库;任何回写异常整体回滚;所有变更写入 memory_events(before/after)。
+    """
     settings = load_settings(db)
     profile = resolve_profile(settings, "fast")
     chapter = db.get_chapter(cid)
@@ -447,40 +840,75 @@ def finalize_chapter(pid, cid):
         raise ValueError("本章还没有正文,无法定稿。")
     project = _load(pid)
     idx = chapter["idx"]
-
-    prev_chapters = [ch for ch in db.list_chapters(pid) if ch["idx"] < idx]
-    summary_text = _chat(pid, "summary", profile,
-                         prompts.summary_messages(project, chapter, prev_chapters, chapter["content"]))
-    db.update_chapter(cid, {"summary": summary_text})
+    chapters = db.list_chapters(pid)
+    prev_chapters = [ch for ch in chapters if ch["idx"] < idx]
 
     chars = db.list_characters(pid)
     fores = db.list_foreshadowing(pid)
+    plots = db.list_plotlines(pid)
+    reader_rows = db.list_reader(pid)
+    char_states = db.list_character_states(pid)
+
+    summary_text = _chat(pid, "summary", profile,
+                         prompts.summary_messages(project, chapter, prev_chapters, chapter["content"]))
     known = "、".join(c["name"] for c in chars) or "(暂无)"
     open_titles = "、".join(f["title"] for f in fores if f["status"] == "open") or "(暂无)"
     state_text = _chat(pid, "state", profile,
                        prompts.state_extract_messages(project, chapter, chapter["content"], known, open_titles),
                        json_mode=True)
-    state = extract_json(state_text)
-    for c in state.get("characters", []) or []:
-        if isinstance(c, dict) and c.get("name"):
-            db.upsert_character(pid, c.get("name", ""), c.get("role", ""),
-                                c.get("profile", ""), c.get("status", ""))
-    for f in state.get("foreshadowing", []) or []:
-        if isinstance(f, dict) and f.get("title"):
-            db.upsert_foreshadow(pid, f.get("title", ""), f.get("description", ""),
-                                 f.get("action", "plant"), idx)
-    for pl in state.get("plotlines", []) or []:
-        if isinstance(pl, dict) and pl.get("title"):
-            db.upsert_plotline(pid, pl.get("title", ""), pl.get("description", ""),
-                               pl.get("action", "start"), idx)
-    for r in state.get("reader_state", []) or []:
-        if isinstance(r, dict) and r.get("content"):
-            db.upsert_reader(pid, r.get("kind", "known"), r.get("content", ""),
-                             idx, r.get("action", "add"))
-    db.update_chapter(cid, {"status": "final"})
-    db.touch_project(pid)
-    db.add_log(pid, "finalize", f"第{idx}章 定稿,摘要 {len(summary_text)}字")
-    return {"summary": summary_text, "state": state}
+    raw_state = extract_json(state_text)
+    state, validation = _validate_state(
+        raw_state, chars, fores, plots, reader_rows, idx, chapters, char_states
+    )
+
+    with db.transaction():
+        db.update_chapter(cid, {"summary": summary_text})
+        db.add_memory_event(
+            pid, idx, "chapter", "update",
+            before=_snap_chapter(chapter),
+            after={"idx": idx, "title": chapter.get("title"), "status": "final", "summary": summary_text},
+        )
+        for c in state["characters"]:
+            before = _snap_character(db.get_character(pid, c["name"]))
+            res = db.upsert_character(
+                pid, c["name"], c["role"], c["profile"], c["status"], chapter_idx=idx
+            )
+            after = _snap_character(db.get_character(pid, c["name"]))
+            if before != after:
+                db.add_memory_event(
+                    pid, idx, "character",
+                    "create" if (res and res.get("created")) else "update",
+                    before=before, after=after, entity_id=(res or {}).get("id"),
+                )
+            if res and res.get("status_guard"):
+                validation["warnings"].append(
+                    f"角色「{c['name']}」当前状态未回退(旧章重定稿;时间线已追加)"
+                )
+            if c["status"]:
+                st = db.add_character_state(pid, c["name"], idx, c["status"])
+                _log_memory_result(pid, idx, "character_state", st, _snap_character_state)
+        for f in state["foreshadowing"]:
+            res = db.upsert_foreshadow(pid, f["title"], f["description"], f["action"], idx)
+            _log_memory_result(pid, idx, "foreshadowing", res, _snap_foreshadow)
+        for p in state["plotlines"]:
+            res = db.upsert_plotline(pid, p["title"], p["description"], p["action"], idx)
+            _log_memory_result(pid, idx, "plotline", res, _snap_plotline)
+        for r in state["reader_state"]:
+            res = db.upsert_reader(pid, r["kind"], r["content"], idx, r["action"])
+            _log_memory_result(pid, idx, "reader", res, _snap_reader)
+        db.update_chapter(cid, {"status": "final"})
+        db.touch_project(pid)
+        db.add_log(
+            pid, "finalize",
+            f"第{idx}章 定稿,摘要 {len(summary_text)}字,"
+            f"状态校验提示 {len(validation['warnings'])} 条/修正 {len(validation['fixes'])} 条",
+        )
+        if validation["warnings"] or validation["fixes"]:
+            db.add_memory_event(
+                pid, idx, "validation", "check",
+                after={"warnings": validation["warnings"], "fixes": validation["fixes"]},
+            )
+    return {"summary": summary_text, "state": state, "validation": validation}
 
 
 def import_text(pid, text):

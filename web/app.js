@@ -148,6 +148,7 @@ async function selectProject(pid) {
   if (state.streaming) { toast("正在生成中,请稍候", true); return; }
   if (!confirmDiscard()) return;
   state.pid = pid;
+  state.publish = null;
   await loadProject();
   renderProjectList();
   switchTab("setting");
@@ -167,7 +168,7 @@ async function deleteProject(pid) {
   if (!confirm(`确定删除作品《${p ? p.title : pid}》?该操作不可恢复。`)) return;
   await api(`/projects/${pid}`, { method: "DELETE" });
   if (state.pid === pid) {
-    state.pid = null; state.bundle = null; state.cid = null;
+    state.pid = null; state.bundle = null; state.cid = null; state.publish = null;
     $("#projTitle").textContent = "未选择作品";
     $("#tabs").classList.add("hidden");
     $("#view").innerHTML = `<div class="empty-hint"><h2>已删除</h2><p>选择或新建一部作品继续。</p></div>`;
@@ -218,6 +219,7 @@ function switchTab(tab) {
   else if (tab === "write") renderWrite(view);
   else if (tab === "review") renderReview(view);
   else if (tab === "export") renderExport(view);
+  else if (tab === "publish") renderPublish(view);
   state.dirty = false;
 }
 
@@ -776,6 +778,7 @@ function renderWrite(view) {
       <div class="statusline" id="batch-log"></div>
       <details class="ctx">
         <summary>查看本章将注入的上下文(前情 / 角色状态 / 相关旧情节 / 伏笔 / Lorebook)</summary>
+        <div id="ctx-budget" style="font-size:12px;color:var(--ink-soft);padding:6px 8px;margin:6px 0;background:rgba(127,127,127,.08);border-radius:6px;"></div>
         <pre id="ctx-pre">点击 summary 展开时自动加载…</pre>
       </details>
 
@@ -816,6 +819,19 @@ function renderWrite(view) {
         const r = await api(`/projects/${state.pid}/chapters/${state.cid}/context`);
         $("#ctx-pre").textContent = r.context;
         $("#ctx-pre").dataset.loaded = "1";
+        const b = r.budget || {};
+        const budgetEl = $("#ctx-budget");
+        if (b.layers) {
+          const parts = b.layers.filter(l => l.used > 0)
+            .map(l => `${l.label} ${l.used}/${l.quota}`).join(" · ");
+          budgetEl.textContent = `预算 ${b.budget} 字 · 已用 ${b.used} 字 · 剩余 ${b.remaining} 字 · ${parts}`
+            + (b.dropped_total ? ` · 裁掉 ${b.dropped_total} 条` : "");
+          budgetEl.title = b.layers.filter(l => l.dropped_count)
+            .map(l => `${l.label} 裁掉 ${l.dropped_count} 条:${(l.dropped || []).join("、")}`).join("\n");
+        } else {
+          budgetEl.textContent = "";
+          budgetEl.title = "";
+        }
       } catch (e) { $("#ctx-pre").textContent = "加载失败:" + e.message; }
     }
   });
@@ -1133,6 +1149,261 @@ async function renderExport(view) {
     } catch (e) { toast(e.message, true); }
     $("#imp-status").textContent = "";
     await loadProject(); renderExport(view);
+  };
+}
+
+/* ---------------- 发布页 ---------------- */
+
+const PUB_ACTION = {
+  create: { txt: "新建", cls: "b-create" },
+  update: { txt: "更新", cls: "b-update" },
+  skip: { txt: "跳过", cls: "b-skip" },
+};
+
+function pubFmtTime(s) { return s ? s.slice(5, 16) : "—"; }
+
+async function renderPublish(view) {
+  const st = state.publish || (state.publish = { platform: null, range: null, data: null, rowState: {}, logs: [] });
+  view.innerHTML = `<div class="card"><h3>加载发布状态…</h3></div>`;
+  try {
+    st.data = await api(`/projects/${state.pid}/publish`);
+  } catch (e) {
+    view.innerHTML = `<div class="card"><h3>发布状态加载失败</h3><p class="statusline">${esc(e.message)}</p></div>`;
+    return;
+  }
+  if (!st.data.platforms.length) {
+    view.innerHTML = `<div class="card"><h3>暂无可用平台</h3><p class="statusline">当前版本只注册了番茄小说,后续平台会按同一驱动接口接入。</p></div>`;
+    return;
+  }
+  if (!st.platform || !st.data.platforms.some(x => x.key === st.platform)) {
+    st.platform = st.data.platforms[0].key;
+  }
+  const p = () => st.data.platforms.find(x => x.key === st.platform);
+  const plat = p();
+  const chapters = curChapters();
+  const written = chapters.filter(c => (c.content || "").trim());
+  const maxWritten = written.length ? Math.max(...written.map(c => c.idx)) : 0;
+  if (!st.range) {
+    const mapped = (plat.map || []).map(r => Number(r.idx)).filter(n => n > 0);
+    const cap = mapped.length ? Math.max(...mapped) : 0;
+    const hi = maxWritten ? Math.min(maxWritten, cap || maxWritten) : Math.max(1, chapters.length);
+    st.range = { lo: 1, hi: Math.max(1, hi), mode: "range" };
+  }
+
+  function pubLog(text) {
+    st.logs.push(`${new Date().toLocaleTimeString("zh-CN", { hour12: false })}  ${text}`);
+    if (st.logs.length > 300) st.logs.splice(0, st.logs.length - 300);
+    const box = $("#pub-log");
+    if (box) { box.textContent = st.logs.join("\n"); box.scrollTop = box.scrollHeight; }
+  }
+
+  function readRange() {
+    const mode = $('input[name="pub-mode"]:checked').value;
+    let lo = parseInt($("#pub-lo").value, 10) || 1;
+    let hi = parseInt($("#pub-hi").value, 10) || lo;
+    if (mode === "single") hi = lo;
+    if (hi < lo) { const t = lo; lo = hi; hi = t; }
+    st.range = { lo, hi, mode };
+    const wrap = $("#pub-hi-wrap");
+    if (wrap) wrap.style.display = mode === "single" ? "none" : "";
+    return { lo, hi };
+  }
+
+  function planItems() {
+    const { lo, hi } = readRange();
+    const force = $("#pub-force").checked;
+    return (plat.plan || [])
+      .filter(i => i.idx >= lo && i.idx <= hi)
+      .map(i => (force && i.action === "skip" && i.chapter_id)
+        ? { ...i, action: "update", reason: "强制同步" } : i);
+  }
+
+  function updateRow(idx, text) {
+    const tr = $(`#pub-plan-body tr[data-idx="${idx}"]`);
+    if (tr) tr.lastElementChild.textContent = text;
+  }
+
+  function renderPlanRows() {
+    const items = planItems();
+    const cnt = { create: 0, update: 0, skip: 0 };
+    items.forEach(i => { cnt[i.action] = (cnt[i.action] || 0) + 1; });
+    $("#pub-plan-summary").textContent =
+      `${items.length} 章:新建 ${cnt.create} / 更新 ${cnt.update} / 跳过 ${cnt.skip}`;
+    $("#pub-plan-body").innerHTML = items.map(i => {
+      const a = PUB_ACTION[i.action] || PUB_ACTION.skip;
+      const live = st.rowState[i.idx];
+      return `<tr data-idx="${i.idx}">
+        <td>${i.idx}</td>
+        <td>${esc(i.title)}</td>
+        <td>${i.words}</td>
+        <td>${i.platform_words || "—"}</td>
+        <td><span class="badge ${a.cls}">${a.txt}</span></td>
+        <td>${esc(i.reason || "")}</td>
+        <td>${live || (i.synced_at ? esc(pubFmtTime(i.synced_at)) : "—")}</td>
+      </tr>`;
+    }).join("") || `<tr><td colspan="7" class="statusline">所选范围没有章节</td></tr>`;
+    const todo = items.filter(i => i.action !== "skip").length;
+    $("#pub-hint").textContent = todo ? `待同步 ${todo} 章` : "所选范围无需同步";
+  }
+
+  const mapCount = (plat.map || []).length;
+  const initialLogs = st.logs.join("\n");
+  view.innerHTML = `
+    <div class="card">
+      <h3>平台发布 <span class="hint">初版支持番茄;后续平台按同一驱动接口注册后会自动出现在这里</span></h3>
+      <div class="row">
+        <select id="pub-platform" style="max-width:200px">
+          ${st.data.platforms.map(x => `<option value="${esc(x.key)}" ${x.key === st.platform ? "selected" : ""}>${esc(x.label)}</option>`).join("")}
+        </select>
+        <span class="badge ${plat.bound ? "b-resolved" : "b-planned"}">${plat.bound ? "已绑定" : "未绑定"}</span>
+        <input type="text" id="pub-book" value="${esc(plat.book_id)}" placeholder="平台书籍 ID(作家后台 URL 里的数字)" style="max-width:320px">
+        <button class="btn btn-sm" id="pub-bind">保存绑定</button>
+      </div>
+      <div class="statusline">
+        平台章节映射 ${mapCount} 条${plat.site ? " · " + esc(plat.site) : ""}${plat.bound ? "" : " · 先填书籍 ID 并保存,再拉取平台映射"}
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>同步范围 <span class="hint">支持单章或一个连续章节范围;只提交有改动的章节</span></h3>
+      <div class="row">
+        <label class="row"><input type="radio" name="pub-mode" value="range" ${st.range.mode === "range" ? "checked" : ""}> 范围</label>
+        <label class="row"><input type="radio" name="pub-mode" value="single" ${st.range.mode === "single" ? "checked" : ""}> 单章</label>
+        <span>第</span><input type="number" id="pub-lo" min="1" value="${st.range.lo}" style="width:88px">
+        <span id="pub-hi-wrap">到第 <input type="number" id="pub-hi" min="1" value="${st.range.hi}" style="width:88px"> 章</span>
+        <label class="row"><input type="checkbox" id="pub-force"> 强制覆盖(内容未变也同步)</label>
+        <label class="row"><input type="checkbox" id="pub-dry"> 只预演(不提交)</label>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button class="btn" id="pub-pull" data-lock title="读取平台章节列表与章节 ID,不改平台内容">⟳ 拉取平台映射</button>
+        <button class="btn btn-primary" id="pub-sync" data-lock>同步到${esc(plat.label)}</button>
+        <span class="statusline" id="pub-hint" style="margin:0"></span>
+      </div>
+      <div class="statusline">
+        提示:平台已有章节但本地没有映射时,会显示「新建」;首次拉取映射后,已映射章节会标记为「更新」,确认后再同步。
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>同步计划 <span class="hint" id="pub-plan-summary"></span></h3>
+      <table class="tbl pub-plan">
+        <thead><tr><th>章</th><th>标题</th><th>本地字数</th><th>平台字数</th><th>动作</th><th>说明</th><th>状态</th></tr></thead>
+        <tbody id="pub-plan-body"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>运行日志</h3>
+      <div class="stream-box" id="pub-log" style="display:block;max-height:260px;">${esc(initialLogs)}</div>
+    </div>
+  `;
+
+  renderPlanRows();
+
+  $("#pub-platform").onchange = (e) => {
+    st.platform = e.target.value;
+    st.range = null;
+    renderPublish(view);
+  };
+  $("#pub-bind").onclick = async () => {
+    const book = $("#pub-book").value.trim();
+    if (!book) { toast("请填写平台书籍 ID", true); return; }
+    try {
+      st.data = await api(`/projects/${state.pid}/publish/${st.platform}/binding`, {
+        method: "PUT", body: JSON.stringify({ book_id: book }),
+      });
+      toast("已保存平台绑定");
+      renderPublish(view);
+    } catch (e) { toast(e.message, true); }
+  };
+  $$('input[name="pub-mode"]').forEach(el => el.onchange = () => renderPlanRows());
+  $("#pub-lo").oninput = () => renderPlanRows();
+  $("#pub-hi").oninput = () => renderPlanRows();
+  $("#pub-force").onchange = () => renderPlanRows();
+
+  $("#pub-pull").onclick = async () => {
+    if (!plat.bound) { toast("先保存平台书籍 ID", true); return; }
+    if (!confirm("将打开平台章节列表并读取章节 ID(不改平台内容),可能需要几分钟。继续?")) return;
+    st.rowState = {};
+    pubLog("开始拉取平台章节映射…");
+    try {
+      const r = await sse(`/projects/${state.pid}/publish/${st.platform}/pull`, {}, {
+        onEvent: e => {
+          if (e.type === "pull_start") pubLog(`书籍 ${e.book_id}:读取章节列表`);
+          else if (e.type === "pull_row") pubLog(`第 ${e.idx} 章「${e.title}」→ ${e.chapter_id || "无章节ID"} (${e.words || 0} 字)`);
+          else if (e.type === "pull_done") pubLog(`平台共 ${e.platform_rows} 章,匹配本地 ${e.matched} 章`);
+          else pubLog(JSON.stringify(e));
+        },
+      });
+      toast(`映射已更新:平台 ${r.platform_rows} 章`);
+      (r.warnings || []).forEach(w => pubLog("警告:" + w));
+      st.data = await api(`/projects/${state.pid}/publish`);
+      renderPublish(view);
+    } catch (e) {
+      toast(e.message, true);
+      pubLog("拉取失败:" + e.message);
+    }
+  };
+
+  $("#pub-sync").onclick = async () => {
+    if (!plat.bound) { toast("先保存平台书籍 ID", true); return; }
+    const { lo, hi } = readRange();
+    const items = planItems();
+    const todo = items.filter(i => i.action !== "skip");
+    if (!todo.length) { toast("所选范围没有需要同步的章节"); return; }
+    const dry = $("#pub-dry").checked;
+    const force = $("#pub-force").checked;
+    const c = todo.filter(i => i.action === "create").length;
+    const u = todo.filter(i => i.action === "update").length;
+    if (!dry) {
+      const ok = confirm(
+        `同步第 ${lo}–${hi} 章到${plat.label}:\n新建 ${c} 章、更新 ${u} 章,跳过 ${items.length - todo.length} 章。\n\n` +
+        `将直接提交到平台(「是否使用 AI」自动选「否」),确定继续?`
+      );
+      if (!ok) return;
+    }
+    st.rowState = {};
+    todo.forEach(i => { st.rowState[i.idx] = "排队中…"; });
+    renderPlanRows();
+    pubLog(`${dry ? "预演" : "开始同步"}第 ${lo}–${hi} 章(新建 ${c} / 更新 ${u})`);
+    try {
+      const r = await sse(`/projects/${state.pid}/publish/${st.platform}/sync`,
+        { lo, hi, force, dry }, {
+          onEvent: e => {
+            if (e.type === "chapter_start") {
+              st.rowState[e.idx] = "同步中…";
+              updateRow(e.idx, "同步中…");
+              pubLog(`[${e.action === "create" ? "新建" : "更新"}] 第 ${e.idx} 章 ${e.title || ""}`);
+            } else if (e.type === "chapter_done") {
+              const txt = e.ok
+                ? (e.dry ? "预演通过" : `✓ ${e.action === "create" ? "新建" : "更新"}`)
+                : "✗ " + (e.error || "失败");
+              st.rowState[e.idx] = txt;
+              updateRow(e.idx, txt);
+              const dryInfo = e.dry
+                ? `(${e.dry.platform_title || "无标题"} / 平台 ${e.dry.platform_len || 0} 字${e.dry.title_match === false ? " / 标题不一致" : ""})`
+                : "";
+              pubLog(`第 ${e.idx} 章:${txt}${dryInfo}`);
+            } else pubLog(JSON.stringify(e));
+          },
+        });
+      const parts = [];
+      if (r && r.dry) {
+        const okN = (r.items || []).filter(i => i.ok).length;
+        const badN = (r.items || []).filter(i => !i.ok).length;
+        parts.push(`预演通过 ${okN} 章`);
+        if (badN) parts.push(`失败 ${badN} 章`);
+      } else if (r) {
+        parts.push(`完成 ${r.done} 章`, `新建 ${r.created}`, `更新 ${r.updated}`, `跳过 ${r.skipped}`);
+        if (r.failed) parts.push(`失败 ${r.failed}`);
+      }
+      toast(parts.join(" · ") || "同步结束");
+      st.data = await api(`/projects/${state.pid}/publish`);
+      renderPublish(view);
+    } catch (e) {
+      toast(e.message, true);
+      pubLog("同步失败:" + e.message);
+    }
   };
 }
 
