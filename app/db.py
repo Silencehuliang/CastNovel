@@ -143,6 +143,28 @@ CREATE TABLE IF NOT EXISTS memory_events(
 );
 CREATE INDEX IF NOT EXISTS idx_memory_events_project
   ON memory_events(project_id, chapter_idx, id);
+CREATE TABLE IF NOT EXISTS publish_bindings(
+  project_id INTEGER NOT NULL,
+  platform TEXT NOT NULL,        -- fanqie / qidian / ...
+  book_id TEXT NOT NULL,         -- 平台书籍 ID
+  config TEXT DEFAULT '{}',      -- {"volume_map":[{"lo":1,"hi":12,"name":"卷名"}],"ai_flag":"no","space":"castnovel-fanqie"}
+  updated_at TEXT DEFAULT (datetime('now','localtime')),
+  PRIMARY KEY(project_id, platform)
+);
+CREATE TABLE IF NOT EXISTS publish_map(
+  project_id INTEGER NOT NULL,
+  platform TEXT NOT NULL,
+  book_id TEXT NOT NULL,
+  idx INTEGER NOT NULL,          -- 本地章号
+  platform_chapter_id TEXT DEFAULT '',  -- 平台章节 ID(编辑页 URL 用)
+  title TEXT DEFAULT '',
+  words INTEGER DEFAULT 0,       -- 平台侧字数
+  content_hash TEXT DEFAULT '',  -- 本次同步内容的 sha1(用于跳过未变更)
+  status TEXT DEFAULT 'mapped',  -- mapped(仅有映射) / published(已同步) / failed
+  note TEXT DEFAULT '',
+  synced_at TEXT DEFAULT (datetime('now','localtime')),
+  PRIMARY KEY(project_id, platform, book_id, idx)
+);
 """
 
 # 运行时增量迁移:旧库缺列时补齐
@@ -269,7 +291,8 @@ def update_project(pid, fields: dict):
 
 _PROJECT_TABLES = (
     "character_states", "characters", "chapters", "foreshadowing", "usage_stats",
-    "logs", "plotlines", "lorebook", "embeddings", "reader_state", "memory_events",
+    "logs", "plotlines", "lorebook", "embeddings", "reader_state",
+    "publish_bindings", "publish_map", "memory_events",
 )
 
 
@@ -357,6 +380,10 @@ def list_chapters(pid, with_content=True):
 
 def get_chapter(cid):
     return one("SELECT * FROM chapters WHERE id=?", (cid,))
+
+
+def get_chapter_by_idx(pid, idx):
+    return one("SELECT * FROM chapters WHERE project_id=? AND idx=?", (pid, idx))
 
 
 def update_chapter(cid, fields: dict):
@@ -735,3 +762,80 @@ def sum_usage(pid):
         # 中文场景粗略估算:约 1.6 字符/Token,仅作展示参考
         "approx_tokens": int((row["pc"] + row["cc"]) / 1.6),
     }
+
+
+# ---------- 平台发布(番茄等) ----------
+
+def get_publish_binding(pid, platform):
+    return one(
+        "SELECT * FROM publish_bindings WHERE project_id=? AND platform=?",
+        (pid, platform),
+    )
+
+
+def set_publish_binding(pid, platform, book_id, config=None):
+    run(
+        "INSERT INTO publish_bindings(project_id,platform,book_id,config) VALUES(?,?,?,?) "
+        "ON CONFLICT(project_id,platform) DO UPDATE SET book_id=excluded.book_id, "
+        "config=excluded.config, updated_at=datetime('now','localtime')",
+        (pid, platform, str(book_id), json.dumps(config or {}, ensure_ascii=False)),
+    )
+
+
+def list_publish_map(pid, platform, book_id=None):
+    if book_id is None:
+        b = get_publish_binding(pid, platform)
+        book_id = b["book_id"] if b else ""
+    return q(
+        "SELECT * FROM publish_map WHERE project_id=? AND platform=? AND book_id=? ORDER BY idx",
+        (pid, platform, str(book_id)),
+    )
+
+
+def get_publish_map_row(pid, platform, idx, book_id=None):
+    if book_id is None:
+        b = get_publish_binding(pid, platform)
+        book_id = b["book_id"] if b else ""
+        if not book_id:
+            return None
+    return one(
+        "SELECT * FROM publish_map WHERE project_id=? AND platform=? AND book_id=? AND idx=?",
+        (pid, platform, str(book_id), idx),
+    )
+
+
+def upsert_publish_map(pid, platform, book_id, idx, **fields):
+    """插入或更新章节映射。fields: platform_chapter_id/title/words/content_hash/status/note。"""
+    allowed = {k: v for k, v in fields.items()
+               if k in ("platform_chapter_id", "title", "words", "content_hash", "status", "note") and v is not None}
+    cur = get_publish_map_row(pid, platform, idx, book_id)
+    if cur is None:
+        run(
+            "INSERT INTO publish_map(project_id,platform,book_id,idx,platform_chapter_id,title,words,content_hash,status,note) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (pid, platform, str(book_id), idx,
+             allowed.get("platform_chapter_id", ""), allowed.get("title", ""),
+             int(allowed.get("words") or 0), allowed.get("content_hash", ""),
+             allowed.get("status", "mapped"), allowed.get("note", "")),
+        )
+        return
+    if allowed:
+        sets = ", ".join(f"{k}=?" for k in allowed)
+        run(
+            f"UPDATE publish_map SET {sets}, synced_at=datetime('now','localtime') "
+            "WHERE project_id=? AND platform=? AND book_id=? AND idx=?",
+            (*allowed.values(), pid, platform, str(book_id), idx),
+        )
+
+
+def delete_publish_map(pid, platform, idx=None, book_id=None):
+    if book_id is None:
+        b = get_publish_binding(pid, platform)
+        book_id = b["book_id"] if b else ""
+    if idx is None:
+        run("DELETE FROM publish_map WHERE project_id=? AND platform=? AND book_id=?", (pid, platform, str(book_id)))
+    else:
+        run(
+            "DELETE FROM publish_map WHERE project_id=? AND platform=? AND book_id=? AND idx=?",
+            (pid, platform, str(book_id), idx),
+        )

@@ -24,7 +24,7 @@ if sys.platform == "win32":
 
 from mcp.server.fastmcp import FastMCP
 
-from app import db, export, stages
+from app import db, export, publish, stages
 from app.config import load_settings
 
 db.init()
@@ -457,22 +457,29 @@ def list_lore_entries(project_id: int) -> str:
 
 
 @mcp.tool()
-def upsert_lore_entry(project_id: int, keywords: str, content: str, note: str = "", enabled: bool = True) -> str:
-    """添加/更新 Lorebook 条目:正文或章纲命中任一关键词时,该条内容自动注入生成上下文。
+def upsert_lore_entry(project_id: int, keywords: str, content: str, note: str = "",
+                      enabled: bool = True, secondary: str = "", logic: str = "and_any",
+                      constant: bool = False, priority: int = 0) -> str:
+    """添加 Lorebook 条目(六字段):正文或章纲命中主键时,该条内容自动注入生成上下文。
 
     Args:
-        keywords: 触发关键词,逗号分隔,如「玉佩, 青黛」
+        keywords: 触发主键,逗号分隔,如「玉佩, 青黛」;常驻条目可留空
         content: 命中后注入的设定内容(人物细节、规则、事实),保持简短
         note: 备注,可空
         enabled: 是否启用
+        secondary: 次级键,逗号分隔;配合 logic 二次过滤
+        logic: and_any / and_all / not_any / not_all,默认 and_any
+        constant: 常驻条目,不经命中直接注入
+        priority: 注入顺序,大者优先,默认 0
     """
     _need_project(project_id)
-    if not keywords.strip() or not content.strip():
-        return "错误:keywords 与 content 均不能为空"
-    lid = db.add_lore(project_id, keywords, content, note)
-    if not enabled:
-        db.update_lore(lid, {"enabled": 0})
-    return (f"Lorebook 条目已添加 id={lid}(触发词:{keywords.strip()})。"
+    if not content.strip() or (not keywords.strip() and not constant):
+        return "错误:content 不能为空;非常驻条目 keywords 也不能为空"
+    if logic not in ("and_any", "and_all", "not_any", "not_all"):
+        logic = "and_any"
+    lid = db.add_lore(project_id, keywords, content, note, secondary=secondary, logic=logic,
+                      constant=constant, priority=priority, enabled=enabled)
+    return (f"Lorebook 条目已添加 id={lid}(触发词:{keywords.strip() or '常驻'})。"
             f"之后生成章节时,只要章纲/前情命中关键词就会自动注入。")
 
 
@@ -570,6 +577,54 @@ def get_reader_state(project_id: int, only_open: bool = True) -> str:
 
 
 @mcp.tool()
+def get_character_history(project_id: int, name: str) -> str:
+    """查看角色状态沿革(时间性事实):定稿时每次状态变化作为一条事件记录(角色+章节+状态),
+    支持按章回放——「第 N 章时这个角色是什么状态」。乱序写作/改稿不串味。
+
+    Args:
+        name: 角色名(与 characters 表一致)
+    """
+    _need_project(project_id)
+    if not name.strip():
+        return "错误:请提供角色名"
+    rows = db.list_character_states(project_id, name=name.strip())
+    if not rows:
+        return f"《{name.strip()}》暂无状态记录(定稿章节后自动抽取,或手工登记)。"
+    lines = [f"《{name.strip()}》状态沿革({len(rows)} 条事件):"]
+    lines += [f"  - 第{r['chapter_idx']}章起:{r['status']}" for r in rows]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def export_lorebook(project_id: int) -> str:
+    """导出为 SillyTavern World Info JSON(可直接导入 ST / NovelAI 生态复用现成 worldbook)。"""
+    _need_project(project_id)
+    rows = db.list_lore(project_id)
+    if not rows:
+        return "暂无 Lorebook 条目,无需导出。"
+    return json.dumps(stages.export_lore(project_id), ensure_ascii=False)
+
+
+@mcp.tool()
+def import_lorebook(project_id: int, data: str) -> str:
+    """导入 SillyTavern World Info JSON(merge,不清空现有条目)。
+
+    Args:
+        data: ST 格式 JSON 字符串({entries:{...}}),或 [{keywords,content,...}] 数组,或单条对象
+    """
+    _need_project(project_id)
+    try:
+        payload = json.loads(data)
+    except Exception as e:
+        return f"错误:不是合法 JSON({e})"
+    try:
+        n = stages.import_lore(project_id, payload)
+    except Exception as e:
+        return f"错误:{e}"
+    return f"已导入 {n} 条 Lorebook 条目(关键词命中后自动注入上下文)。"
+
+
+@mcp.tool()
 def edit_reader_state(state_id: int, action: str = "resolve", content: str = "") -> str:
     """手工修正读者认知条目:action=resolve(标记已兑现/已揭穿)、reopen、delete,或 content 更新文本。"""
     row = db.one("SELECT * FROM reader_state WHERE id=?", (state_id,))
@@ -602,6 +657,102 @@ def run_gate_check(project_id: int, chapter_idx: int) -> str:
     except Exception as e:
         return f"错误:{e}"
     return f"第{chapter_idx}章门禁重算完成。\n{_gate_brief(gate)}"
+
+
+@mcp.tool()
+def get_publish_status(project_id: int) -> str:
+    """查看平台发布状态:绑定书籍、已映射章节数、逐章同步计划(新建/更新/跳过)。
+
+    改完稿后先用它确认哪些章需要推送;真实同步用 sync_to_platform(dry=True) 预演。
+    """
+    _need_project(project_id)
+    ov = publish.overview(project_id)
+    lines = []
+    for p in ov["platforms"]:
+        head = f"{p['label']}({p['key']})"
+        if not p["bound"]:
+            lines.append(f"- {head}:未绑定(用 set_publish_binding 设置书籍 ID)")
+            continue
+        plan = p["plan"]
+        cnt = {a: sum(1 for i in plan if i["action"] == a) for a in ("create", "update", "skip")}
+        lines.append(f"- {head}:book_id={p['book_id']},映射 {len(p['map'])} 章,"
+                     f"计划 新建 {cnt['create']} / 更新 {cnt['update']} / 跳过 {cnt['skip']}")
+        todo = [i for i in plan if i["action"] != "skip"]
+        for i in todo[:15]:
+            lines.append(f"    第{i['idx']}章《{i['title']}》{i['action']} —— {i['reason']}")
+        if len(todo) > 15:
+            lines.append(f"    …另有 {len(todo) - 15} 章待处理")
+    return "平台发布状态:\n" + "\n".join(lines)
+
+
+@mcp.tool()
+def set_publish_binding(project_id: int, book_id: str, platform: str = "fanqie") -> str:
+    """绑定平台书籍 ID(番茄作家后台 URL 中的数字)。绑定后才能拉映射与同步。"""
+    _need_project(project_id)
+    try:
+        publish.set_binding(project_id, platform, book_id)
+    except Exception as e:
+        return f"错误:{e}"
+    return f"已绑定 {platform} 书籍 {book_id}。建议下一步:pull_publish_mapping(project_id={project_id})。"
+
+
+@mcp.tool()
+def pull_publish_mapping(project_id: int, platform: str = "fanqie", with_ids: bool = True) -> str:
+    """拉取平台章节列表/章节 ID 写入本地映射(只读,不改平台内容)。
+
+    需要本机 ego-browser 已登录平台,耗时约 1~3 分钟;首次同步前必须先拉一次映射,
+    否则本地会把平台已发布的章节当作新章节重复上传。
+    """
+    _need_project(project_id)
+    try:
+        r = publish.pull_mapping(project_id, platform, with_ids=with_ids)
+    except Exception as e:
+        return f"错误:{e}"
+    out = (f"映射已更新:{platform} 平台 {r['platform_rows']} 章,"
+           f"匹配本地 {r['matched']} 章")
+    if r["unmatched"]:
+        out += f";平台有而本地没有的章:{r['unmatched']}"
+    if r.get("warnings"):
+        out += "\n警告:\n" + "\n".join(f"  - {w}" for w in r["warnings"])
+    return out
+
+
+@mcp.tool()
+def sync_to_platform(project_id: int, lo: int, hi: int = 0, platform: str = "fanqie",
+                     force: bool = False, dry: bool = False) -> str:
+    """把某一章(hi 省略即单章)或 [lo, hi] 范围同步到平台。
+
+    无映射→新建章节,本地内容有改动→覆盖平台章节,内容未变→跳过。
+    dry=True 只预演:打开编辑页核对标题/字数,不提交。会驱动本机 ego-browser
+    (需已登录平台),耗时随章数增长;提交时「是否使用 AI」固定选「否」。
+    """
+    _need_project(project_id)
+    lo = int(lo)
+    hi = int(hi or lo)
+    if lo < 1:
+        return "错误:lo 必须 ≥ 1"
+    if hi < lo:
+        lo, hi = hi, lo
+    try:
+        r = publish.sync_chapters(project_id, platform, lo, hi, force=force, dry=dry)
+    except Exception as e:
+        return f"错误:{e}"
+    if r.get("dry"):
+        lines = [f"预演第 {lo}-{hi} 章(未提交):"]
+        for i in r["items"]:
+            mark = "✓" if i.get("ok") else "✗"
+            extra = ""
+            if i.get("error"):
+                extra = f" —— {i['error']}"
+            elif i.get("dry"):
+                extra = f" —— {i['dry']}"
+            lines.append(f"  {mark} 第{i['idx']}章《{i['title']}》{i['action']}{extra}")
+        return "\n".join(lines)
+    out = (f"同步完成:共 {r['done']} 章(新建 {r['created']} / 更新 {r['updated']}),"
+           f"跳过 {r['skipped']} 章,失败 {r['failed']} 章")
+    for err in r["errors"]:
+        out += f"\n  - 第{err['idx']}章:{err['error']}"
+    return out
 
 
 if __name__ == "__main__":

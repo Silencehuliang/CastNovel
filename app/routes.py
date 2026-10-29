@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from app import db, export, stages
+from app import db, export, publish, stages
 from app.config import PROVIDER_PRESETS, find_profile, is_mock, load_settings, resolve_profile, save_settings
 from app.llm import LLMError, chat, list_models
 
@@ -56,6 +56,18 @@ class ChapterPatch(BaseModel):
     status: str | None = None
 
 
+class PublishBindingIn(BaseModel):
+    book_id: str
+    config: dict | None = None
+
+
+class PublishSyncIn(BaseModel):
+    lo: int | None = None
+    hi: int | None = None
+    force: bool = False
+    dry: bool = False
+
+
 class CharacterIn(BaseModel):
     name: str
     role: str = ""
@@ -87,6 +99,38 @@ def _sse_stage(fn):
             kind, payload = q.get()
             if kind == "delta":
                 yield f"data: {json.dumps({'type': 'delta', 'text': payload}, ensure_ascii=False)}\n\n"
+            elif kind == "done":
+                yield f"data: {json.dumps({'type': 'done', 'result': payload}, ensure_ascii=False)}\n\n"
+                break
+            else:
+                yield f"data: {json.dumps({'type': 'error', 'message': str(payload)}, ensure_ascii=False)}\n\n"
+                break
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _sse_progress(fn):
+    """fn(emit) 在工作线程中执行;emit 的进度事件实时推给前端,结束后推 result。"""
+
+    def gen():
+        q: queue.Queue = queue.Queue()
+
+        def worker():
+            try:
+                result = fn(emit=lambda evt: q.put(("progress", evt)))
+                q.put(("done", result))
+            except Exception as e:
+                q.put(("error", str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+        while True:
+            kind, payload = q.get()
+            if kind == "progress":
+                yield f"data: {json.dumps({'type': 'progress', 'data': payload}, ensure_ascii=False)}\n\n"
             elif kind == "done":
                 yield f"data: {json.dumps({'type': 'done', 'result': payload}, ensure_ascii=False)}\n\n"
                 break
@@ -490,10 +534,14 @@ def cascade(pid: int, payload: CascadeIn):
 # ---------- Lorebook(关键词触发设定注入) ----------
 
 class LoreIn(BaseModel):
-    keywords: str
+    keywords: str = ""
     content: str
     note: str = ""
     enabled: bool = True
+    secondary: str = ""
+    logic: str = "and_any"
+    constant: bool = False
+    priority: int = 0
 
 
 @router.get("/projects/{pid}/lore")
@@ -503,20 +551,26 @@ def list_lore(pid: int):
 
 @router.post("/projects/{pid}/lore")
 def add_lore(pid: int, payload: LoreIn):
-    if not payload.keywords.strip() or not payload.content.strip():
-        raise HTTPException(status_code=400, detail="关键词与内容均不能为空")
-    lid = db.add_lore(pid, payload.keywords, payload.content, payload.note)
+    if not payload.content.strip() or (not payload.keywords.strip() and not payload.constant):
+        raise HTTPException(status_code=400, detail="内容不能为空;非常驻条目关键词也不能为空")
+    lid = db.add_lore(pid, payload.keywords, payload.content, payload.note,
+                      secondary=payload.secondary, logic=payload.logic,
+                      constant=payload.constant, priority=payload.priority,
+                      enabled=payload.enabled)
     return {"id": lid}
 
 
 @router.put("/projects/{pid}/lore/{lid}")
 def patch_lore(pid: int, lid: int, payload: dict):
     fields = {}
-    for k in ("keywords", "content", "note"):
+    for k in ("keywords", "secondary", "logic", "content", "note"):
         if k in payload and payload[k] is not None:
             fields[k] = payload[k]
-    if "enabled" in payload:
-        fields["enabled"] = 1 if payload["enabled"] else 0
+    for k in ("enabled", "constant"):
+        if k in payload:
+            fields[k] = 1 if payload[k] else 0
+    if "priority" in payload and payload["priority"] is not None:
+        fields["priority"] = int(payload["priority"])
     db.update_lore(lid, fields)
     return {"ok": True}
 
@@ -525,6 +579,37 @@ def patch_lore(pid: int, lid: int, payload: dict):
 def remove_lore(pid: int, lid: int):
     db.delete_lore(lid)
     return {"ok": True}
+
+
+@router.get("/projects/{pid}/lore/export")
+def export_lore(pid: int):
+    """导出为 SillyTavern World Info JSON(可直接导入 ST / NovelAI 生态)。"""
+    _bundle(pid)
+    return stages.export_lore(pid)
+
+
+class LoreImportIn(BaseModel):
+    data: dict | list
+
+
+@router.post("/projects/{pid}/lore/import")
+def import_lore(pid: int, payload: LoreImportIn):
+    """导入 SillyTavern World Info JSON(merge,不清空现有条目)。"""
+    _bundle(pid)
+    try:
+        n = stages.import_lore(pid, payload.data)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"count": n}
+
+
+# ---------- 角色状态时间线 ----------
+
+@router.get("/projects/{pid}/character-states")
+def character_states(pid: int, name: str = ""):
+    """角色状态沿革(时间性事实):按章回放;name 留空返回全部角色的事件。"""
+    _bundle(pid)
+    return db.list_character_states(pid, name=name or None)
 
 
 # ---------- 读者认知状态 ----------
@@ -674,3 +759,42 @@ def do_export(pid: int, format: str = "md"):
         return Response(content=data, media_type=media, headers=_headers(name))
     text, name, media = export.export_text(project, chapters, fmt=format)
     return Response(content=text.encode("utf-8"), media_type=media, headers=_headers(name))
+
+
+# ---------- 平台发布 / 同步 ----------
+
+@router.get("/projects/{pid}/publish")
+def publish_overview(pid: int):
+    if not db.get_project(pid):
+        raise HTTPException(status_code=404, detail="项目不存在")
+    return publish.overview(pid)
+
+
+@router.put("/projects/{pid}/publish/{platform}/binding")
+def publish_bind(pid: int, platform: str, payload: PublishBindingIn):
+    try:
+        publish.set_binding(pid, platform, payload.book_id, payload.config)
+    except publish.PublishError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return publish.overview(pid)
+
+
+@router.get("/projects/{pid}/publish/{platform}/plan")
+def publish_plan(pid: int, platform: str, lo: int | None = None,
+                 hi: int | None = None, force: bool = False):
+    try:
+        return {"items": publish.plan(pid, platform, lo, hi, force)}
+    except publish.PublishError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/projects/{pid}/publish/{platform}/pull")
+def publish_pull(pid: int, platform: str, with_ids: bool = True):
+    return _sse_progress(lambda emit: publish.pull_mapping(
+        pid, platform, with_ids=with_ids, on_event=emit))
+
+
+@router.post("/projects/{pid}/publish/{platform}/sync")
+def publish_sync(pid: int, platform: str, payload: PublishSyncIn):
+    return _sse_progress(lambda emit: publish.sync_chapters(
+        pid, platform, payload.lo, payload.hi, payload.force, payload.dry, on_event=emit))

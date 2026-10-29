@@ -1,7 +1,7 @@
 ---
 name: castnovel
-description: 用 CastNovel(铸书)工坊创作 AI 长篇小说:设定→大纲→章纲→正文→审校→定稿→导出全流程。当用户想写小说、续写章节、改稿润色、导出成书,或提到 CastNovel/铸书/我的作品时使用本技能。
-version: 1.0.0
+description: 用 CastNovel(铸书)工坊创作 AI 长篇小说:设定→大纲→章纲→正文→审校→定稿→导出→发布同步全流程。当用户想写小说、续写章节、改稿润色、导出成书、同步番茄,或提到 CastNovel/铸书/我的作品时使用本技能。
+version: 1.1.0
 metadata: 'author: CastNovel requires: CastNovel 仓库(mcp_server.py 或 python main.py)'
 license: MIT
 ---
@@ -42,6 +42,17 @@ license: MIT
 - **读者认知状态**:`get_reader_state` 查看读者已知/期待/误认(定稿时自动抽取,写作时自动注入)——已知防复述、期待管兑现、误认控反转时机;抽错时用 `edit_reader_state` 修正
 - **设定变更影响分析**:改设定前先 `search_impact`(关键词)反查受影响章节,评估回改范围;改完用 `run_gate_check` 刷新门禁
 - **级联重生成**:章纲/设定改动后,受影响章节用 REST `POST /api/projects/{pid}/cascade`(MCP 无对应工具时引导用户在 Web 大纲页点「⚡ 级联重生成」)
+
+## 发布与同步(番茄先行)
+
+改完稿后把正文推送到连载平台:
+
+1. `get_publish_status` 查看绑定与逐章计划(新建/更新/跳过)
+2. 首次先 `pull_publish_mapping` 拉取平台章节目录与章节 ID(只读;不拉会把平台已有章节当新章重复上传)
+3. `sync_to_platform(dry=True)` 预演,确认后去掉 dry 真同步;单章只传 lo 即可,范围传 lo+hi
+4. 绑定书籍用 `set_publish_binding`(番茄作家后台 URL 里的书籍 ID)
+
+驱动走本机 ego-browser 已登录的作家后台,提交时「是否使用 AI」固定选「否」;耗时随章数增长。Web 端对应「发布」页,可选择单章/范围、看计划表与实时进度。
 
 ## 质量纪律
 

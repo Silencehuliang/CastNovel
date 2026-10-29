@@ -1,6 +1,6 @@
 # CastNovel API 速查(MCP 工具 + REST 端点)
 
-## MCP 工具(mcp_server.py,stdio,共 25 个)
+## MCP 工具(mcp_server.py,stdio,共 32 个)
 
 ### 作品
 | 工具 | 参数 | 说明 |
@@ -40,6 +40,14 @@
 | `get_reader_state` / `edit_reader_state` | 读者认知(已知/期待/误认):定稿自动抽取,写作自动注入;手工修正 |
 | `run_gate_check` | 对当前正文重跑一致性门禁(零 token),update_chapter 后调用 |
 
+### 平台发布(番茄先行)
+| 工具 | 参数 | 说明 |
+|---|---|---|
+| `get_publish_status` | project_id | 绑定信息 + 已映射章节 + 逐章计划(新建/更新/跳过) |
+| `set_publish_binding` | project_id, book_id, platform="fanqie" | 绑定平台书籍 ID(作家后台 URL 中的数字) |
+| `pull_publish_mapping` | project_id, platform="fanqie", with_ids=True | 拉平台章节目录/章节 ID 落本地映射(只读,需 ego-browser 已登录) |
+| `sync_to_platform` | project_id, lo, hi=0, platform="fanqie", force=False, dry=False | 单章(hi 省略)或范围同步;无映射→新建,有改动→覆盖,未变→跳过;dry 只预演 |
+
 ## REST 端点(服务 `python main.py [端口]`,前缀 `/api`)
 
 生成类 POST 均为 **SSE 流**:`data: {"type":"delta","text":…}`(过程)/ `{"type":"done","result":…}` / `{"type":"error","message":…}`;批量/级联为 `{"type":"progress","data":{event,…}}` 事件流。
@@ -59,6 +67,11 @@
 | `GET/POST /projects/{pid}/lore`,`PUT/DELETE /projects/{pid}/lore/{lid}` | Lorebook CRUD |
 | `PUT /projects/{pid}/plotlines/{plid}` / `PUT .../foreshadowing/{fid}` | 情节线/伏笔手工修正 |
 | `GET /projects/{pid}/export?format=epub` | 导出下载 |
+| `GET /projects/{pid}/publish` | 发布总览:平台列表 + 绑定 + 章节映射 + 同步计划 |
+| `PUT /projects/{pid}/publish/{platform}/binding` | 绑定书籍 body {book_id, config?} |
+| `GET /projects/{pid}/publish/{platform}/plan?lo=&hi=&force=` | 范围内逐章计划(create/update/skip) |
+| `POST /projects/{pid}/publish/{platform}/pull?with_ids=true` | 拉平台映射(SSE progress 事件流) |
+| `POST /projects/{pid}/publish/{platform}/sync` | 同步 body {lo, hi, force, dry}(SSE progress 事件流) |
 | `GET /settings`,`PUT /settings`,`POST /llm/test`,`POST /llm/models`,`GET /providers` | 模型配置:档案(强/快/Embedding)、连接测试、拉模型列表、14 家供应商模板 |
 
 ## 配置要点

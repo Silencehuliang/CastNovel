@@ -45,22 +45,23 @@
 | 章节版本历史 + 回滚 | ✅ | goink、书童 |
 | 批量连写 + 熔断 | ✅ | wfcz10086、chinese-novelist-skill |
 | 去 AI 味润色(负面清单 + 文风样本) | ✅ | chinese-novelist-skill、goink |
-| 确定性去 AI 味 lint(规则集+改写方向,并入门禁) | ✅ | oh-story lint、Humanizer-zh、inkflow |
-| span 级检测+带例改写两步管线 | 🔮 v0.3 | arXiv:2409.14509 |
 | 拆书导入 | ✅ | Long-Novel-GPT、书童 |
 | EPUB 导出 | ✅ | Openwrite、gpt-author |
 | 强/快模型分档 + 用量 | ✅ | AI_NovelGenerator、Openwrite |
 | mock 离线模式 | ✅ | (自研,测试友好) |
 | 确定性去 AI 味 lint(13 条规则+改写方向,并入门禁) | ✅ v0.2 | oh-story lint、Humanizer-zh、inkflow |
-| span 级检测+带例改写两步管线 | 🔮 v0.3 | arXiv:2409.14509 |
-| 读者认知状态(已知/期待/误认) | 🔮 v0.3 | goink、oh-story 双时间线、inkflow 信息边界 |
-| Lorebook 兼容引擎(ST JSON 导入导出) | 🔮 v0.3 | SillyTavern/NovelAI/KoboldAI World Info |
-| 级联大纲影响分析 | 🔮 v0.4 | jarvis-write |
-| 生成候选拉样+择优 | 🔮 v0.4 | Re3、Plan-and-Write、inkos forecast |
-| 向量语义检索(可选) | 🔮 v0.4 | goink、moshu |
+| span 级检测+带例改写两步管线 | ✅ v0.3 | arXiv:2409.14509 |
+| 读者认知状态(已知/期待/误认) | ✅ v0.4 | goink、oh-story 双时间线、inkflow 信息边界 |
+| Lorebook 兼容引擎(六字段+ST JSON 导入导出) | ✅ v0.5 | SillyTavern/NovelAI/KoboldAI World Info |
+| 角色状态时间线(按章回放) | ✅ v0.5 | jarvis-write、oh-story 双时间线 |
+| 级联大纲影响分析 | ✅ v0.3 | jarvis-write |
+| 生成候选拉样+择优 | ✅ v0.3 | Re3、Plan-and-Write、inkos forecast |
+| 向量语义检索(可选) | ✅ v0.3 | goink、moshu |
+| 检索时近加权(BM25/向量) | ✅ v0.5 | MemGPT 注意力公式 |
 | 信息边界过滤(POV 知识台账) | 🔮 v0.4 | dramatica-flow、novel-studio |
 | 设定变更「提案-批准」流 | 🔮 v0.4 | show-me-the-story、ai-novel-studio |
-| 时间性事实(绑定章节有效区间) | 🔮 v1.0 | jarvis-write |
+| 时间性事实(绑定章节有效区间) | 🟡 v0.5(角色状态已落地,通用事实区间留 v1.0) | jarvis-write |
+| 平台发布工具链(番茄浏览器驱动/映射/同步) | ✅ v0.5(API/MCP/UI 已接入;待真实同步验证) | (自研,个人工作流) |
 | 事实账本 + 只读投影 | 🔮 v1.0 | webnovel-writer |
 | 章节提交链分叉/合流 | 🔮 v1.0 | webnovel-writer + ST 分支语义 |
 | 扫榜/拆文前置链路 | 🔮 v1.0 | oh-story、tianyan、fanqie-radar |
@@ -193,13 +194,14 @@
 |---|---|---|
 | v0.1 | 五页签工作台 + 三层记忆 + 流水线 + SSE + mock | ✅ 2026-10-27 |
 | v0.2 | 门禁(字数/人物覆盖/重复率/AI味 lint)、版本回滚、批量连写(熔断)、情节线、文风样本、EPUB | ✅ 2026-10-28 |
-| v0.3 | span 级检测+带例改写两步管线、Lorebook 兼容引擎(ST JSON)、两步矛盾检查、读者认知状态 | 规划 |
-| v0.4 | 级联大纲影响分析、候选拉样+成对择优、可选向量检索、信息边界过滤、动态大纲(DOME) | 规划 |
-| v1.0 | 时间性事实、事实账本投影、章节提交链分叉、扫榜拆文前置、阶段绑定 Skill 包 | 远期 |
+| v0.3 | span 级检测+带例改写两步管线、Lorebook 兼容引擎(ST JSON)、级联大纲影响分析、候选拉样+成对择优、可选向量检索 | ✅ 2026-10-28 |
+| v0.4 | 读者认知状态、门禁重算、模型接入体验、Agent Skill 包 | ✅ 2026-10-29 |
+| v0.5 | Lorebook 六字段+ST 导入导出、角色状态时间线(按章回放)、检索时近加权、番茄发布工具链 | 🚧 2026-10-29(发布 API/MCP/UI 已接入,已拉取 1-24 章映射;待真实同步验证) |
+| v1.0 | 时间性事实(角色状态已提前落地)、事实账本投影、章节提交链分叉、扫榜拆文前置、阶段绑定 Skill 包 | 远期 |
 
 ## 8. 非目标
 
-多人协作/云同步;工作流画布;无人值守全自动整书;平台自动发布;训练/微调模型。理由见 research.md「刻意不做」。
+多人协作/云同步;工作流画布;无人值守全自动整书;平台自动发布(作为产品能力;番茄发布工具链仅作个人工作流实验,见 v0.5);训练/微调模型。理由见 research.md「刻意不做」。
 
 ## 9. 风险与对策
 
