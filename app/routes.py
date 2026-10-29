@@ -211,10 +211,9 @@ def patch_project(pid: int, payload: ProjectPatch):
 
 @router.delete("/projects/{pid}")
 def delete_project(pid: int):
-    db.run("DELETE FROM characters WHERE project_id=?", (pid,))
-    db.run("DELETE FROM chapters WHERE project_id=?", (pid,))
-    db.run("DELETE FROM foreshadowing WHERE project_id=?", (pid,))
-    db.run("DELETE FROM projects WHERE id=?", (pid,))
+    if not db.get_project(pid):
+        raise HTTPException(status_code=404, detail="项目不存在")
+    db.delete_project_data(pid)
     return {"ok": True}
 
 
@@ -318,6 +317,16 @@ def finalize(pid: int, cid: int):
         return result
 
     return _sse_stage(run)
+
+
+# ---------- 记忆变更审计 ----------
+
+@router.get("/projects/{pid}/memory-events")
+def memory_events(pid: int, chapter_idx: int | None = None, limit: int = 200):
+    """定稿回写的 before/after 变更日志(按时间倒序)。"""
+    if not db.get_project(pid):
+        raise HTTPException(status_code=404, detail="项目不存在")
+    return db.list_memory_events(pid, chapter_idx=chapter_idx, limit=limit)
 
 
 # ---------- 章节编辑 ----------

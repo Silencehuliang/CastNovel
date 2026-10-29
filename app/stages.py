@@ -27,6 +27,86 @@ def _chat(pid, stage, profile, messages, on_delta=None, json_mode=False):
     return text
 
 
+# ---------- Lorebook 兼容引擎(ST World Info 导入导出) ----------
+
+_LORE_LOGIC_TO_ST = {"and_any": 0, "not_all": 1, "not_any": 2, "and_all": 3}
+_LORE_LOGIC_FROM_ST = {v: k for k, v in _LORE_LOGIC_TO_ST.items()}
+
+
+def _split_keys(raw):
+    if isinstance(raw, list):
+        return ", ".join(str(k).strip() for k in raw if str(k).strip())
+    return str(raw or "").strip()
+
+
+def export_lore(pid):
+    """导出为 SillyTavern World Info JSON(可直接导入 ST / NovelAI 生态)。"""
+    _load(pid)
+    entries = {}
+    for i, r in enumerate(db.list_lore(pid)):
+        secondary = (r.get("secondary") or "").strip()
+        entries[str(i)] = {
+            "uid": i,
+            "key": [k.strip() for k in re.split(r"[,，、;；\s]+", r["keywords"] or "") if k.strip()],
+            "keysecondary": [k.strip() for k in re.split(r"[,，、;；\s]+", secondary) if k.strip()],
+            "comment": r.get("note") or "",
+            "content": r["content"],
+            "constant": bool(r.get("constant")),
+            "selective": bool(secondary),
+            "selectiveLogic": _LORE_LOGIC_TO_ST.get(r.get("logic") or "and_any", 0),
+            "order": int(r.get("priority") or 0) + 100,
+            "position": 0,
+            "disable": not r.get("enabled"),
+            "addMemo": True,
+            "displayIndex": i,
+        }
+    return {"name": "castnovel-lorebook", "entries": entries}
+
+
+def import_lore(pid, data):
+    """导入 SillyTavern World Info JSON(merge,不清空现有条目),返回导入条数。"""
+    _load(pid)
+    raw = []
+    if isinstance(data, dict) and isinstance(data.get("entries"), dict):
+        raw = list(data["entries"].values())
+    elif isinstance(data, list):
+        raw = data
+    elif isinstance(data, dict) and data.get("content"):
+        raw = [data]
+    if not raw:
+        raise ValueError("未识别的格式:需要 SillyTavern World Info JSON(entries 字段)或条目数组")
+    n = 0
+    for e in raw:
+        if not isinstance(e, dict):
+            continue
+        content = str(e.get("content") or "").strip()
+        keys = _split_keys(e.get("key") or e.get("keys") or e.get("keywords"))
+        constant = 1 if e.get("constant") else 0
+        if not content or (not keys and not constant):
+            continue
+        logic = e.get("logic")
+        if logic not in _LORE_LOGIC_TO_ST:
+            try:
+                sel = int(e.get("selectiveLogic") or 0)
+            except (TypeError, ValueError):
+                sel = 0
+            logic = _LORE_LOGIC_FROM_ST.get(sel, "and_any")
+        try:
+            priority = max(0, min(999, int(e.get("order")) - 100)) if e.get("order") is not None else 0
+        except (TypeError, ValueError):
+            priority = 0
+        db.add_lore(
+            pid, keys, content, _split_keys(e.get("comment") or e.get("note")),
+            secondary=_split_keys(e.get("keysecondary") or e.get("secondary")),
+            logic=logic, constant=constant, priority=priority,
+            enabled=0 if e.get("disable") else 1,
+        )
+        n += 1
+    if not n:
+        raise ValueError("导入文件里没有可用条目(缺少 content,或既无 key 也非 constant)")
+    return n
+
+
 # ---------- 程序化一致性门禁(不依赖模型自觉,借鉴 wfcz10086/天命) ----------
 
 def _ngrams(text, n=8):
@@ -438,8 +518,47 @@ def revise_chapter(pid, cid, on_delta=None):
     return text
 
 
+def _snap_character(row):
+    return {k: row.get(k) for k in ("name", "role", "profile", "status")} if row else None
+
+
+def _snap_character_state(row):
+    return {k: row.get(k) for k in ("name", "chapter_idx", "status")} if row else None
+
+
+def _snap_foreshadow(row):
+    return {k: row.get(k) for k in ("title", "description", "planted_ch", "payoff_ch", "status")} if row else None
+
+
+def _snap_plotline(row):
+    return {k: row.get(k) for k in ("title", "description", "start_ch", "last_ch", "status")} if row else None
+
+
+def _snap_reader(row):
+    return {k: row.get(k) for k in ("kind", "content", "chapter_idx", "status")} if row else None
+
+
+def _snap_chapter(row):
+    return {k: row.get(k) for k in ("idx", "title", "status", "summary")} if row else None
+
+
+def _log_memory_result(pid, idx, entity, result, snap):
+    if not result or result.get("action") in (None, "noop"):
+        return
+    action = result["action"]
+    after = snap(result.get("after"))
+    if action == "skipped":
+        after = {"reason": result.get("reason")}
+    db.add_memory_event(
+        pid, idx, entity, action,
+        before=snap(result.get("before")), after=after,
+        status="skipped" if action == "skipped" else "applied",
+        entity_id=result.get("id"),
+    )
+
+
 def finalize_chapter(pid, cid):
-    """定稿:用快模型生成摘要 + 抽取人物状态与伏笔变化,写入故事圣经。"""
+    """定稿:快模型生成摘要 + 抽取状态 JSON → 单事务回写故事圣经 + memory_events 审计。"""
     settings = load_settings(db)
     profile = resolve_profile(settings, "fast")
     chapter = db.get_chapter(cid)
@@ -447,39 +566,62 @@ def finalize_chapter(pid, cid):
         raise ValueError("本章还没有正文,无法定稿。")
     project = _load(pid)
     idx = chapter["idx"]
-
     prev_chapters = [ch for ch in db.list_chapters(pid) if ch["idx"] < idx]
-    summary_text = _chat(pid, "summary", profile,
-                         prompts.summary_messages(project, chapter, prev_chapters, chapter["content"]))
-    db.update_chapter(cid, {"summary": summary_text})
 
     chars = db.list_characters(pid)
     fores = db.list_foreshadowing(pid)
     known = "、".join(c["name"] for c in chars) or "(暂无)"
     open_titles = "、".join(f["title"] for f in fores if f["status"] == "open") or "(暂无)"
+    summary_text = _chat(pid, "summary", profile,
+                         prompts.summary_messages(project, chapter, prev_chapters, chapter["content"]))
     state_text = _chat(pid, "state", profile,
                        prompts.state_extract_messages(project, chapter, chapter["content"], known, open_titles),
                        json_mode=True)
     state = extract_json(state_text)
-    for c in state.get("characters", []) or []:
-        if isinstance(c, dict) and c.get("name"):
-            db.upsert_character(pid, c.get("name", ""), c.get("role", ""),
-                                c.get("profile", ""), c.get("status", ""))
-    for f in state.get("foreshadowing", []) or []:
-        if isinstance(f, dict) and f.get("title"):
-            db.upsert_foreshadow(pid, f.get("title", ""), f.get("description", ""),
-                                 f.get("action", "plant"), idx)
-    for pl in state.get("plotlines", []) or []:
-        if isinstance(pl, dict) and pl.get("title"):
-            db.upsert_plotline(pid, pl.get("title", ""), pl.get("description", ""),
-                               pl.get("action", "start"), idx)
-    for r in state.get("reader_state", []) or []:
-        if isinstance(r, dict) and r.get("content"):
-            db.upsert_reader(pid, r.get("kind", "known"), r.get("content", ""),
-                             idx, r.get("action", "add"))
-    db.update_chapter(cid, {"status": "final"})
-    db.touch_project(pid)
-    db.add_log(pid, "finalize", f"第{idx}章 定稿,摘要 {len(summary_text)}字")
+    if not isinstance(state, dict):
+        raise ValueError("定稿状态不是 JSON 对象")
+
+    with db.transaction():
+        db.update_chapter(cid, {"summary": summary_text})
+        db.add_memory_event(
+            pid, idx, "chapter", "update",
+            before=_snap_chapter(chapter),
+            after={"idx": idx, "title": chapter.get("title"), "status": "final", "summary": summary_text},
+        )
+        for c in state.get("characters", []) or []:
+            if not (isinstance(c, dict) and c.get("name")):
+                continue
+            before = _snap_character(db.get_character(pid, c["name"]))
+            res = db.upsert_character(pid, c["name"], c.get("role", ""),
+                                      c.get("profile", ""), c.get("status", ""))
+            after = _snap_character(db.get_character(pid, c["name"]))
+            if before != after:
+                db.add_memory_event(
+                    pid, idx, "character",
+                    "create" if (res and res.get("created")) else "update",
+                    before=before, after=after, entity_id=(res or {}).get("id"),
+                )
+            if c.get("status"):
+                st = db.add_character_state(pid, c["name"], idx, c["status"])
+                _log_memory_result(pid, idx, "character_state", st, _snap_character_state)
+        for f in state.get("foreshadowing", []) or []:
+            if isinstance(f, dict) and f.get("title"):
+                res = db.upsert_foreshadow(pid, f.get("title", ""), f.get("description", ""),
+                                           f.get("action", "plant"), idx)
+                _log_memory_result(pid, idx, "foreshadowing", res, _snap_foreshadow)
+        for pl in state.get("plotlines", []) or []:
+            if isinstance(pl, dict) and pl.get("title"):
+                res = db.upsert_plotline(pid, pl.get("title", ""), pl.get("description", ""),
+                                         pl.get("action", "start"), idx)
+                _log_memory_result(pid, idx, "plotline", res, _snap_plotline)
+        for r in state.get("reader_state", []) or []:
+            if isinstance(r, dict) and r.get("content"):
+                res = db.upsert_reader(pid, r.get("kind", "known"), r.get("content", ""),
+                                       idx, r.get("action", "add"))
+                _log_memory_result(pid, idx, "reader", res, _snap_reader)
+        db.update_chapter(cid, {"status": "final"})
+        db.touch_project(pid)
+        db.add_log(pid, "finalize", f"第{idx}章 定稿,摘要 {len(summary_text)}字")
     return {"summary": summary_text, "state": state}
 
 

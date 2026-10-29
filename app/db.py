@@ -2,13 +2,23 @@
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 
 from app.config import DB_PATH
 
-_lock = threading.Lock()
+_lock = threading.RLock()
 _conn = None
+_tx_depth = 0
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS character_states(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  name TEXT NOT NULL,            -- 角色名(与 characters.name 对应)
+  chapter_idx INTEGER NOT NULL,  -- 该状态自第 idx 章定稿起生效(双时间线之「事件时间线」)
+  status TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
 CREATE TABLE IF NOT EXISTS projects(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   title TEXT NOT NULL,
@@ -91,7 +101,11 @@ CREATE TABLE IF NOT EXISTS plotlines(
 CREATE TABLE IF NOT EXISTS lorebook(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id INTEGER NOT NULL,
-  keywords TEXT NOT NULL,
+  keywords TEXT NOT NULL,          -- 主键(逗号分隔,命中其一即候选)
+  secondary TEXT DEFAULT '',       -- 次级键(逗号分隔,配合 logic 二次过滤)
+  logic TEXT DEFAULT 'and_any',    -- and_any / and_all / not_any / not_all
+  constant INTEGER DEFAULT 0,      -- 常驻:不依赖命中,直接注入
+  priority INTEGER DEFAULT 0,      -- 注入顺序,大者优先;预算不足时让位
   content TEXT NOT NULL,
   note TEXT DEFAULT '',
   enabled INTEGER DEFAULT 1,
@@ -114,12 +128,31 @@ CREATE TABLE IF NOT EXISTS reader_state(
   status TEXT DEFAULT 'open',    -- open / done(期待已兑现、误认已揭穿)
   created_at TEXT DEFAULT (datetime('now','localtime'))
 );
+CREATE TABLE IF NOT EXISTS memory_events(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  chapter_idx INTEGER,
+  entity TEXT NOT NULL,          -- character / character_state / foreshadowing / plotline / reader / chapter / validation
+  entity_id INTEGER,
+  action TEXT NOT NULL,          -- create / update / resolve / noop / skipped / check
+  before TEXT DEFAULT '',        -- 变更前快照(JSON)
+  after TEXT DEFAULT '',         -- 变更后快照(JSON)
+  source TEXT DEFAULT 'finalize',
+  status TEXT DEFAULT 'applied', -- applied / skipped / rejected
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_memory_events_project
+  ON memory_events(project_id, chapter_idx, id);
 """
 
 # 运行时增量迁移:旧库缺列时补齐
 _MIGRATE_COLUMNS = [
     ("projects", "style_ref", "TEXT DEFAULT ''"),
     ("chapters", "gate", "TEXT DEFAULT ''"),
+    ("lorebook", "secondary", "TEXT DEFAULT ''"),
+    ("lorebook", "logic", "TEXT DEFAULT 'and_any'"),
+    ("lorebook", "constant", "INTEGER DEFAULT 0"),
+    ("lorebook", "priority", "INTEGER DEFAULT 0"),
 ]
 
 
@@ -138,6 +171,35 @@ def init():
     _conn.commit()
 
 
+@contextmanager
+def transaction():
+    """单连接上的事务边界:块内所有 run() 不单独提交,异常整体回滚。
+
+    只允许一个线程持有事务;块内对 q/one/run 的调用会重入同一把可重入锁。
+    """
+    global _tx_depth
+    init()
+    with _lock:
+        if _tx_depth:
+            _tx_depth += 1
+            try:
+                yield
+            finally:
+                _tx_depth -= 1
+            return
+        _conn.execute("BEGIN IMMEDIATE")
+        _tx_depth = 1
+        try:
+            yield
+        except BaseException:
+            _conn.rollback()
+            raise
+        else:
+            _conn.commit()
+        finally:
+            _tx_depth = 0
+
+
 def q(sql, params=()):
     init()
     with _lock:
@@ -154,7 +216,8 @@ def run(sql, params=()):
     init()
     with _lock:
         cur = _conn.execute(sql, params)
-        _conn.commit()
+        if not _tx_depth:
+            _conn.commit()
         return cur.lastrowid
 
 
@@ -204,34 +267,57 @@ def update_project(pid, fields: dict):
     run(f"UPDATE projects SET {', '.join(sets)} WHERE id=?", tuple(params))
 
 
+_PROJECT_TABLES = (
+    "character_states", "characters", "chapters", "foreshadowing", "usage_stats",
+    "logs", "plotlines", "lorebook", "embeddings", "reader_state", "memory_events",
+)
+
+
+def delete_project_data(pid):
+    """项目删除:同一事务清理全部项目级数据(含章节版本与记忆日志),不留孤儿行。"""
+    cids = [r["id"] for r in q("SELECT id FROM chapters WHERE project_id=?", (pid,))]
+    with transaction():
+        for cid in cids:
+            run("DELETE FROM chapter_versions WHERE chapter_id=?", (cid,))
+        for table in _PROJECT_TABLES:
+            run(f"DELETE FROM {table} WHERE project_id=?", (pid,))
+        run("DELETE FROM projects WHERE id=?", (pid,))
+
+
 # ---------- 角色(故事圣经) ----------
 
 def list_characters(pid):
     return q("SELECT * FROM characters WHERE project_id=? ORDER BY id", (pid,))
 
 
+def get_character(pid, name):
+    return one("SELECT * FROM characters WHERE project_id=? AND name=?", (pid, (name or "").strip()))
+
+
 def upsert_character(pid, name, role="", profile="", status="", overwrite=True):
     name = (name or "").strip()
     if not name:
-        return
-    row = one("SELECT id FROM characters WHERE project_id=? AND name=?", (pid, name))
+        return None
+    row = one("SELECT * FROM characters WHERE project_id=? AND name=?", (pid, name))
     if row:
-        if overwrite:
-            sets, params = [], []
-            if role:
-                sets.append("role=?"); params.append(role)
-            if profile:
-                sets.append("profile=?"); params.append(profile)
-            if status:
-                sets.append("status=?"); params.append(status)
-            if sets:
-                params.append(row["id"])
-                run(f"UPDATE characters SET {', '.join(sets)} WHERE id=?", tuple(params))
-    else:
-        run(
-            "INSERT INTO characters(project_id,name,role,profile,status) VALUES(?,?,?,?,?)",
-            (pid, name, role, profile, status),
-        )
+        if not overwrite:
+            return {"id": row["id"], "created": False, "updated": []}
+        sets, params, updated = [], [], []
+        if role and role != row["role"]:
+            sets.append("role=?"); params.append(role); updated.append("role")
+        if profile and profile != row["profile"]:
+            sets.append("profile=?"); params.append(profile); updated.append("profile")
+        if status and status != row["status"]:
+            sets.append("status=?"); params.append(status); updated.append("status")
+        if sets:
+            params.append(row["id"])
+            run(f"UPDATE characters SET {', '.join(sets)} WHERE id=?", tuple(params))
+        return {"id": row["id"], "created": False, "updated": updated}
+    new_id = run(
+        "INSERT INTO characters(project_id,name,role,profile,status) VALUES(?,?,?,?,?)",
+        (pid, name, role, profile, status),
+    )
+    return {"id": new_id, "created": True, "updated": ["role", "profile", "status"]}
 
 
 def delete_character(cid):
@@ -309,23 +395,33 @@ def list_foreshadowing(pid):
 def upsert_foreshadow(pid, title, description="", action="plant", chapter_idx=None):
     title = (title or "").strip()
     if not title:
-        return
+        return None
     row = one("SELECT * FROM foreshadowing WHERE project_id=? AND title=?", (pid, title))
     if row is None:
         if action == "plant":
-            run(
+            fid = run(
                 "INSERT INTO foreshadowing(project_id,title,description,planted_ch,status) "
                 "VALUES(?,?,?,?,?)",
                 (pid, title, description, chapter_idx, "open"),
             )
-        return
+            after = one("SELECT * FROM foreshadowing WHERE id=?", (fid,))
+            return {"action": "create", "id": fid, "before": None, "after": after}
+        return {"action": "skipped", "id": None, "before": None, "after": None,
+                "reason": "resolve 未匹配到已有伏笔"}
     if action == "resolve":
+        if row["status"] == "resolved":
+            return {"action": "noop", "id": row["id"], "before": row, "after": row}
         run(
             "UPDATE foreshadowing SET payoff_ch=?, status='resolved' WHERE id=?",
             (chapter_idx, row["id"]),
         )
-    elif description and not row["description"]:
+        after = one("SELECT * FROM foreshadowing WHERE id=?", (row["id"],))
+        return {"action": "resolve", "id": row["id"], "before": row, "after": after}
+    if description and not row["description"]:
         run("UPDATE foreshadowing SET description=? WHERE id=?", (description, row["id"]))
+        after = one("SELECT * FROM foreshadowing WHERE id=?", (row["id"],))
+        return {"action": "update", "id": row["id"], "before": row, "after": after}
+    return {"action": "noop", "id": row["id"], "before": row, "after": row}
 
 
 def delete_foreshadow(fid):
@@ -377,22 +473,31 @@ def list_plotlines(pid):
 def upsert_plotline(pid, title, description="", action="start", chapter_idx=None):
     title = (title or "").strip()
     if not title:
-        return
+        return None
     row = one("SELECT * FROM plotlines WHERE project_id=? AND title=?", (pid, title))
     if row is None:
         if action in ("start", "advance"):
-            run(
+            plid = run(
                 "INSERT INTO plotlines(project_id,title,description,start_ch,last_ch,status) "
                 "VALUES(?,?,?,?,?,?)",
                 (pid, title, description, chapter_idx, chapter_idx, "active"),
             )
-        return
+            after = one("SELECT * FROM plotlines WHERE id=?", (plid,))
+            return {"action": "create", "id": plid, "before": None, "after": after}
+        return {"action": "skipped", "id": None, "before": None, "after": None,
+                "reason": "end 未匹配到已有情节线"}
     if action == "end":
+        if row["status"] == "done":
+            return {"action": "noop", "id": row["id"], "before": row, "after": row}
         run("UPDATE plotlines SET last_ch=?, status='done' WHERE id=?", (chapter_idx, row["id"]))
-    else:
-        run("UPDATE plotlines SET last_ch=? WHERE id=?", (chapter_idx, row["id"]))
-        if description and not row["description"]:
-            run("UPDATE plotlines SET description=? WHERE id=?", (description, row["id"]))
+        after = one("SELECT * FROM plotlines WHERE id=?", (row["id"],))
+        return {"action": "end", "id": row["id"], "before": row, "after": after}
+    run("UPDATE plotlines SET last_ch=? WHERE id=?", (chapter_idx, row["id"]))
+    if description and not row["description"]:
+        run("UPDATE plotlines SET description=? WHERE id=?", (description, row["id"]))
+    after = one("SELECT * FROM plotlines WHERE id=?", (row["id"],))
+    action_out = "update" if (after != row) else "noop"
+    return {"action": action_out, "id": row["id"], "before": row, "after": after}
 
 
 def delete_plotline(plid):
@@ -408,15 +513,21 @@ def list_lore(pid, only_enabled=False):
     return q(sql + " ORDER BY id", (pid,))
 
 
-def add_lore(pid, keywords, content, note=""):
+def add_lore(pid, keywords, content, note="", secondary="", logic="and_any",
+             constant=0, priority=0, enabled=1):
     return run(
-        "INSERT INTO lorebook(project_id,keywords,content,note) VALUES(?,?,?,?)",
-        (pid, (keywords or "").strip(), (content or "").strip(), (note or "").strip()),
+        "INSERT INTO lorebook(project_id,keywords,secondary,logic,constant,priority,content,note,enabled) "
+        "VALUES(?,?,?,?,?,?,?,?,?)",
+        (pid, (keywords or "").strip(), (secondary or "").strip(), logic or "and_any",
+         1 if constant else 0, int(priority or 0),
+         (content or "").strip(), (note or "").strip(), 0 if enabled in (0, False) else 1),
     )
 
 
 def update_lore(lid, fields: dict):
-    allowed = {k: fields[k] for k in ("keywords", "content", "note", "enabled") if k in fields}
+    allowed = {k: fields[k] for k in
+               ("keywords", "secondary", "logic", "constant", "priority", "content", "note", "enabled")
+               if k in fields}
     if not allowed:
         return
     sets = ", ".join(f"{k}=?" for k in allowed)
@@ -456,33 +567,40 @@ def list_reader(pid, only_open=False):
 
 def upsert_reader(pid, kind, content, chapter_idx=None, action="add"):
     """定稿抽取入口:add 新增(kind 限 known/expect/mislead,同内容去重);
-    resolve 按 content 匹配未结条目 → 置 done(期待兑现/误认揭穿)。"""
+    resolve 按 content 匹配未结条目 → 置 done(期待兑现/误认揭穿)。返回变更结果供审计。"""
     content = (content or "").strip()
     kind = kind if kind in READER_KINDS else "known"
     if not content:
-        return
+        return None
     row = one(
-        "SELECT id, status FROM reader_state WHERE project_id=? AND kind=? AND content=?",
+        "SELECT * FROM reader_state WHERE project_id=? AND kind=? AND content=?",
         (pid, kind, content),
     )
     if action == "resolve":
         if row and row["status"] == "open":
             run("UPDATE reader_state SET status='done' WHERE id=?", (row["id"],))
-            return
+            after = one("SELECT * FROM reader_state WHERE id=?", (row["id"],))
+            return {"action": "resolve", "id": row["id"], "before": row, "after": after}
         like = one(
-            "SELECT id, status FROM reader_state WHERE project_id=? AND kind=? AND status='open' "
+            "SELECT * FROM reader_state WHERE project_id=? AND kind=? AND status='open' "
             "AND (? LIKE '%'||content||'%' OR content LIKE '%'||?||'%') LIMIT 1",
             (pid, kind, content, content),
         )
         if like:
             run("UPDATE reader_state SET status='done' WHERE id=?", (like["id"],))
-        return
+            after = one("SELECT * FROM reader_state WHERE id=?", (like["id"],))
+            return {"action": "resolve", "id": like["id"], "before": like, "after": after,
+                    "fuzzy": True}
+        return {"action": "skipped", "id": None, "before": None, "after": None,
+                "reason": "未匹配到待结算的读者认知"}
     if row:
-        return
-    run(
+        return {"action": "noop", "id": row["id"], "before": row, "after": row}
+    rid = run(
         "INSERT INTO reader_state(project_id,kind,content,chapter_idx) VALUES(?,?,?,?)",
         (pid, kind, content, chapter_idx),
     )
+    after = one("SELECT * FROM reader_state WHERE id=?", (rid,))
+    return {"action": "create", "id": rid, "before": None, "after": after}
 
 
 def update_reader(rid, fields: dict):
@@ -495,6 +613,93 @@ def update_reader(rid, fields: dict):
 
 def delete_reader(rid):
     run("DELETE FROM reader_state WHERE id=?", (rid,))
+
+
+# ---------- 角色状态时间线(时间性事实:双时间线之「事件时间线」) ----------
+
+def list_character_states(pid, name=None):
+    if name:
+        return q(
+            "SELECT * FROM character_states WHERE project_id=? AND name=? ORDER BY chapter_idx, id",
+            (pid, name),
+        )
+    return q("SELECT * FROM character_states WHERE project_id=? ORDER BY chapter_idx, id", (pid,))
+
+
+def get_character_state(pid, name, chapter_idx):
+    return one(
+        "SELECT * FROM character_states WHERE project_id=? AND name=? AND chapter_idx=? ORDER BY id DESC LIMIT 1",
+        (pid, (name or "").strip(), int(chapter_idx)),
+    )
+
+
+def add_character_state(pid, name, chapter_idx, status):
+    """定稿抽取入口:同人同章去重(重定稿覆盖),状态沿革只追加不删改,支持任意时点回查。"""
+    name = (name or "").strip()
+    status = (status or "").strip()
+    if not name or not status:
+        return None
+    row = get_character_state(pid, name, chapter_idx)
+    if row:
+        if row["status"] == status:
+            return {"action": "noop", "id": row["id"], "before": row, "after": row}
+        run("UPDATE character_states SET status=? WHERE id=?", (status, row["id"]))
+        after = one("SELECT * FROM character_states WHERE id=?", (row["id"],))
+        return {"action": "update", "id": row["id"], "before": row, "after": after}
+    sid = run(
+        "INSERT INTO character_states(project_id,name,chapter_idx,status) VALUES(?,?,?,?)",
+        (pid, name, int(chapter_idx), status),
+    )
+    after = one("SELECT * FROM character_states WHERE id=?", (sid,))
+    return {"action": "create", "id": sid, "before": None, "after": after}
+
+
+def status_asof(states, name, before_idx, current=""):
+    """取角色在第 before_idx 章「当时」的状态:最近一条 chapter_idx < before_idx 的事件;无则回退当前档案。"""
+    evs = [e for e in (states or []) if e.get("name") == name and e.get("chapter_idx", 0) < before_idx]
+    if not evs:
+        return current
+    return max(evs, key=lambda e: (e["chapter_idx"], e["id"])).get("status") or current
+
+
+def delete_character_state(sid):
+    run("DELETE FROM character_states WHERE id=?", (sid,))
+
+
+# ---------- 记忆变更日志(定稿回写的 before/after 审计) ----------
+
+def add_memory_event(pid, chapter_idx, entity, action, before=None, after=None,
+                     source="finalize", status="applied", entity_id=None):
+    """记录一次记忆变更。before/after 统一存 JSON,便于回放与审计。"""
+    def dump(value):
+        if value is None:
+            return ""
+        return json.dumps(value, ensure_ascii=False)
+
+    return run(
+        "INSERT INTO memory_events(project_id,chapter_idx,entity,entity_id,action,before,after,source,status) "
+        "VALUES(?,?,?,?,?,?,?,?,?)",
+        (pid, chapter_idx, entity, entity_id, action, dump(before), dump(after), source, status),
+    )
+
+
+def list_memory_events(pid, chapter_idx=None, limit=200):
+    sql = "SELECT * FROM memory_events WHERE project_id=?"
+    params = [pid]
+    if chapter_idx is not None:
+        sql += " AND chapter_idx=?"
+        params.append(int(chapter_idx))
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(max(1, min(int(limit or 200), 1000)))
+    rows = q(sql, tuple(params))
+    for r in rows:
+        for k in ("before", "after"):
+            if r.get(k):
+                try:
+                    r[k] = json.loads(r[k])
+                except (TypeError, ValueError):
+                    pass
+    return rows
 
 
 def add_usage(pid, stage, prompt_chars, completion_chars):
