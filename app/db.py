@@ -294,30 +294,42 @@ def get_character(pid, name):
     return one("SELECT * FROM characters WHERE project_id=? AND name=?", (pid, (name or "").strip()))
 
 
-def upsert_character(pid, name, role="", profile="", status="", overwrite=True):
+def upsert_character(pid, name, role="", profile="", status="", overwrite=True, chapter_idx=None):
+    """写入角色档案。chapter_idx 用于防止重定稿旧章回退当前状态:
+    只有 chapter_idx >= 该角色最新状态事件章时,才更新 characters.status;时间线仍由 add_character_state 追加。
+    """
     name = (name or "").strip()
     if not name:
         return None
     row = one("SELECT * FROM characters WHERE project_id=? AND name=?", (pid, name))
     if row:
         if not overwrite:
-            return {"id": row["id"], "created": False, "updated": []}
+            return {"id": row["id"], "created": False, "updated": [], "status_guard": False}
         sets, params, updated = [], [], []
         if role and role != row["role"]:
             sets.append("role=?"); params.append(role); updated.append("role")
         if profile and profile != row["profile"]:
             sets.append("profile=?"); params.append(profile); updated.append("profile")
+        status_guard = False
         if status and status != row["status"]:
-            sets.append("status=?"); params.append(status); updated.append("status")
+            latest = one(
+                "SELECT MAX(chapter_idx) AS m FROM character_states WHERE project_id=? AND name=?",
+                (pid, name),
+            )
+            latest_ch = latest["m"] if latest else None
+            if chapter_idx is None or latest_ch is None or int(chapter_idx) >= int(latest_ch):
+                sets.append("status=?"); params.append(status); updated.append("status")
+            else:
+                status_guard = True
         if sets:
             params.append(row["id"])
             run(f"UPDATE characters SET {', '.join(sets)} WHERE id=?", tuple(params))
-        return {"id": row["id"], "created": False, "updated": updated}
+        return {"id": row["id"], "created": False, "updated": updated, "status_guard": status_guard}
     new_id = run(
         "INSERT INTO characters(project_id,name,role,profile,status) VALUES(?,?,?,?,?)",
         (pid, name, role, profile, status),
     )
-    return {"id": new_id, "created": True, "updated": ["role", "profile", "status"]}
+    return {"id": new_id, "created": True, "updated": ["role", "profile", "status"], "status_guard": False}
 
 
 def delete_character(cid):

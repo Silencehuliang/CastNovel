@@ -201,6 +201,8 @@ def state_extract_messages(project, chapter, content, known_chars, open_fores):
    - mislead:本章刻意引导的误认(读者被引导相信、但与作者真相不符)→ add;
    - 本章兑现了此前的期待,或揭穿了此前的误导 → action=resolve,content 填原条目内容;
    - 与前文重复的认知不再记录。各数组无变化时为空。
+5. 所有 action 只能取上述英文值;同一数组内不要出现重复的 name/title/content;
+6. 人物状态涉及死亡/复活时必须写明「死亡」「复活」「诈死」等明确标记,不要用模糊状态制造回退。
 
 【正文】
 {content[:8000]}"""
