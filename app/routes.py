@@ -10,9 +10,9 @@ from fastapi import APIRouter, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from app import db, export, memory, stages
-from app.config import find_profile, is_mock, load_settings, resolve_profile, save_settings
-from app.llm import LLMError, chat
+from app import db, export, stages
+from app.config import PROVIDER_PRESETS, find_profile, is_mock, load_settings, resolve_profile, save_settings
+from app.llm import LLMError, chat, list_models
 
 router = APIRouter()
 
@@ -156,6 +156,29 @@ def test_llm(payload: TestProfileIn):
         return {"ok": False, "error": str(e)}
 
 
+@router.get("/providers")
+def get_providers():
+    """供应商预设:设置页「从模板添加」用,一键填 Base URL 与默认模型。"""
+    return PROVIDER_PRESETS
+
+
+class ModelsProbeIn(BaseModel):
+    base_url: str
+    api_key: str = ""
+    model: str = ""
+    timeout: int = 180
+
+
+@router.post("/llm/models")
+def probe_models(payload: ModelsProbeIn):
+    """拉取某服务的模型列表(不要求先保存档案),供设置页下拉选择。"""
+    try:
+        ids = list_models(payload.model_dump())
+        return {"ok": True, "models": ids}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "models": []}
+
+
 # ---------- 项目 ----------
 
 @router.get("/projects")
@@ -238,6 +261,29 @@ def gen_draft(pid: int, cid: int):
     return _sse_stage(run)
 
 
+class DraftBestIn(BaseModel):
+    n: int = 2
+
+
+@router.post("/projects/{pid}/chapters/{cid}/draft/best")
+def gen_draft_best(pid: int, cid: int, payload: DraftBestIn):
+    """候选拉样+重排:拉 n 份候选,主编评分重排,择优写入;落选稿存入版本历史。"""
+    def run(on_delta):
+        out = stages.gen_draft_best(pid, cid, n=payload.n, on_delta=on_delta)
+        return {**db.get_chapter(cid), "rank": out.get("_rank")}
+
+    return _sse_stage(run)
+
+
+@router.post("/projects/{pid}/chapters/{cid}/deai")
+def deai(pid: int, cid: int):
+    """两步去 AI 味:span 检测 → 带例改写。返回新稿供预览,不落库。"""
+    def run(on_delta):
+        return stages.deai_rewrite(pid, cid, on_delta=on_delta)
+
+    return _sse_stage(run)
+
+
 @router.post("/projects/{pid}/chapters/{cid}/polish")
 def polish(pid: int, cid: int):
     def run(on_delta):
@@ -282,11 +328,7 @@ def get_context(pid: int, cid: int):
     if not chapter:
         raise HTTPException(status_code=404, detail="章节不存在")
     settings = load_settings(db)
-    project = db.get_project(pid)
-    characters = db.list_characters(pid)
-    chapters = db.list_chapters(pid)
-    fores = db.list_foreshadowing(pid)
-    ctx = memory.build_context(project, characters, chapters, fores, chapter["idx"], settings)
+    ctx = stages._ctx_parts(pid, chapter["idx"], settings)[3]
     return {"context": ctx, "chars": len(ctx)}
 
 
@@ -381,6 +423,95 @@ def batch(pid: int, payload: BatchIn):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ---------- 设定变更影响分析 + 级联重生成 ----------
+
+@router.get("/projects/{pid}/impact")
+def impact(pid: int, query: str = ""):
+    """按关键词(角色/地点/设定词,逗号分隔)反查受影响章节。零 token。"""
+    try:
+        return stages.find_impact(pid, query)
+    except Exception as e:
+        _err(e)
+
+
+class CascadeIn(BaseModel):
+    chapter_ids: list[int]
+    include_written: bool = False
+
+
+@router.post("/projects/{pid}/cascade")
+def cascade(pid: int, payload: CascadeIn):
+    def gen():
+        q: queue.Queue = queue.Queue()
+
+        def worker():
+            try:
+                result = stages.cascade_regenerate(
+                    pid, payload.chapter_ids, payload.include_written,
+                    on_event=lambda e: q.put(("ev", e)))
+                q.put(("done", result))
+            except Exception as e:
+                q.put(("error", str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+        while True:
+            kind, data = q.get()
+            if kind == "ev":
+                yield f"data: {json.dumps({'type': 'progress', 'data': data}, ensure_ascii=False)}\n\n"
+            elif kind == "done":
+                yield f"data: {json.dumps({'type': 'done', 'result': data}, ensure_ascii=False)}\n\n"
+                break
+            else:
+                yield f"data: {json.dumps({'type': 'error', 'message': str(data)}, ensure_ascii=False)}\n\n"
+                break
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ---------- Lorebook(关键词触发设定注入) ----------
+
+class LoreIn(BaseModel):
+    keywords: str
+    content: str
+    note: str = ""
+    enabled: bool = True
+
+
+@router.get("/projects/{pid}/lore")
+def list_lore(pid: int):
+    return db.list_lore(pid)
+
+
+@router.post("/projects/{pid}/lore")
+def add_lore(pid: int, payload: LoreIn):
+    if not payload.keywords.strip() or not payload.content.strip():
+        raise HTTPException(status_code=400, detail="关键词与内容均不能为空")
+    lid = db.add_lore(pid, payload.keywords, payload.content, payload.note)
+    return {"id": lid}
+
+
+@router.put("/projects/{pid}/lore/{lid}")
+def patch_lore(pid: int, lid: int, payload: dict):
+    fields = {}
+    for k in ("keywords", "content", "note"):
+        if k in payload and payload[k] is not None:
+            fields[k] = payload[k]
+    if "enabled" in payload:
+        fields["enabled"] = 1 if payload["enabled"] else 0
+    db.update_lore(lid, fields)
+    return {"ok": True}
+
+
+@router.delete("/projects/{pid}/lore/{lid}")
+def remove_lore(pid: int, lid: int):
+    db.delete_lore(lid)
+    return {"ok": True}
 
 
 # ---------- 情节线 ----------

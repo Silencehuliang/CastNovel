@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>CastNovel · 铸书 — AI 长篇小说创作工坊</title>
-  <link rel="stylesheet" href="/style.css?v=0.2" />
+  <link rel="stylesheet" href="/style.css?v=0.3" />
 </head>
 <body>
   <aside id="sidebar">
@@ -13,7 +13,8 @@
     <div id="projectList" class="project-list"></div>
     <div class="sidebar-foot">
       <div id="mockBanner" class="mock-banner hidden">
-        当前为「离线演示」模型,输出为模拟文本。请在设置中配置 API Key。
+        当前为「离线演示」模型,输出为模拟文本。
+        <a href="#" id="btnMockCfg" style="color:#ffd98a;">去配置真实模型 →</a>
       </div>
       <button id="btnSettings" class="btn btn-ghost btn-block">⚙ 设置</button>
     </div>
@@ -41,6 +42,6 @@
 
   <div id="modalRoot"></div>
   <div id="toast" class="hidden"></div>
-  <script src="/app.js?v=0.2"></script>
+  <script src="/app.js?v=0.3"></script>
 </body>
 </html>

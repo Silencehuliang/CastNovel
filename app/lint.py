@@ -67,3 +67,30 @@ def lint_text(text):
             "suggestion": "破折号是 AI 味重灾区,改用逗号或句号断句", "sample": "",
         })
     return issues
+
+
+def lint_spans(text, max_spans=40):
+    """span 级检测(arXiv:2409.14509):返回每处命中的精确片段与行号。
+
+    返回 [{rule, msg, suggestion, span, line}],供两步改写管线逐条定位;
+    超过 max_spans 时截断(改写清单过长会稀释模型注意力)。
+    """
+    import re
+
+    text = text or ""
+    out, seen = [], set()
+    for rule in RULES:
+        for m in re.finditer(rule["pattern"], text):
+            span = m.group(0)
+            if not span.strip():
+                continue
+            line = text.count("\n", 0, m.start()) + 1
+            key = (rule["id"], span)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"rule": rule["id"], "msg": rule["msg"], "suggestion": rule["suggestion"],
+                        "span": span[:60], "line": line})
+            if len(out) >= max_spans:
+                return out
+    return out

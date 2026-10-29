@@ -88,6 +88,23 @@ CREATE TABLE IF NOT EXISTS plotlines(
   last_ch INTEGER,
   UNIQUE(project_id, title)
 );
+CREATE TABLE IF NOT EXISTS lorebook(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  keywords TEXT NOT NULL,
+  content TEXT NOT NULL,
+  note TEXT DEFAULT '',
+  enabled INTEGER DEFAULT 1,
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE TABLE IF NOT EXISTS embeddings(
+  project_id INTEGER NOT NULL,
+  idx INTEGER NOT NULL,
+  model_tag TEXT NOT NULL,
+  vector TEXT NOT NULL,
+  updated_at TEXT DEFAULT (datetime('now','localtime')),
+  PRIMARY KEY(project_id, idx, model_tag)
+);
 """
 
 # 运行时增量迁移:旧库缺列时补齐
@@ -334,6 +351,14 @@ def get_version(vid):
     return one("SELECT * FROM chapter_versions WHERE id=?", (vid,))
 
 
+def add_version_text(cid, text, note=""):
+    """把给定文本(如落选候选)直接存入版本历史。"""
+    return run(
+        "INSERT INTO chapter_versions(chapter_id,content,note) VALUES(?,?,?)",
+        (cid, text or "", note),
+    )
+
+
 # ---------- 情节线 ----------
 
 def list_plotlines(pid):
@@ -363,6 +388,49 @@ def upsert_plotline(pid, title, description="", action="start", chapter_idx=None
 
 def delete_plotline(plid):
     run("DELETE FROM plotlines WHERE id=?", (plid,))
+
+
+# ---------- Lorebook(关键词触发设定注入) ----------
+
+def list_lore(pid, only_enabled=False):
+    sql = "SELECT * FROM lorebook WHERE project_id=?"
+    if only_enabled:
+        sql += " AND enabled=1"
+    return q(sql + " ORDER BY id", (pid,))
+
+
+def add_lore(pid, keywords, content, note=""):
+    return run(
+        "INSERT INTO lorebook(project_id,keywords,content,note) VALUES(?,?,?,?)",
+        (pid, (keywords or "").strip(), (content or "").strip(), (note or "").strip()),
+    )
+
+
+def update_lore(lid, fields: dict):
+    allowed = {k: fields[k] for k in ("keywords", "content", "note", "enabled") if k in fields}
+    if not allowed:
+        return
+    sets = ", ".join(f"{k}=?" for k in allowed)
+    run(f"UPDATE lorebook SET {sets} WHERE id=?", (*allowed.values(), lid))
+
+
+def delete_lore(lid):
+    run("DELETE FROM lorebook WHERE id=?", (lid,))
+
+
+# ---------- 向量缓存(可选语义检索) ----------
+
+def list_embeddings(pid, model_tag):
+    rows = q("SELECT idx, vector FROM embeddings WHERE project_id=? AND model_tag=?", (pid, model_tag))
+    return {r["idx"]: json.loads(r["vector"]) for r in rows}
+
+
+def save_embedding(pid, idx, model_tag, vector):
+    run(
+        "INSERT INTO embeddings(project_id,idx,model_tag,vector) VALUES(?,?,?,?) "
+        "ON CONFLICT(project_id,idx,model_tag) DO UPDATE SET vector=excluded.vector, updated_at=excluded.updated_at",
+        (pid, idx, model_tag, json.dumps(vector)),
+    )
 
 
 def add_usage(pid, stage, prompt_chars, completion_chars):

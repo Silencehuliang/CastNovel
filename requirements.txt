@@ -4,3 +4,9 @@ openai>=1.30
 python-dotenv>=1.0
 # 可选:DOCX 导出
 python-docx>=1.1
+# 可选:MCP Server(接入 CodeBuddy / WorkBuddy,见 README)
+mcp>=1.2
+# 可选:浏览器版 Gemini 桥接(tools/gemini_bridge.py)
+#   cookie 后端(默认/推荐)用 gemini_webapi(需 Python>=3.11),装在 data/gemini-venv,见 README
+#   下面这个只有 --backend dom 的兜底模式才需要
+playwright>=1.44

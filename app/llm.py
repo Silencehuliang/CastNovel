@@ -3,9 +3,12 @@
 - 流式输出通过 on_delta 回调透传给 SSE;
 - json_mode 优先使用 response_format,供应商不支持时自动降级重试;
 - extract_json 负责从模型输出中稳健地抽取 JSON(容忍代码围栏/前后缀);
+- list_models 拉取 /v1/models 供设置页下拉选择;embed 提供可选向量语义检索;
 - 内置 mock 模式(base_url 以 mock:// 开头),离线跑通全流程,用于演示与测试。
 """
+import hashlib
 import json
+import math
 import re
 import time
 
@@ -16,6 +19,16 @@ from app.config import is_mock
 
 class LLMError(RuntimeError):
     pass
+
+
+def _client(profile, timeout=None):
+    api_key = profile.get("api_key") or "EMPTY"  # Ollama/LM Studio 等本地服务不校验 Key
+    return OpenAI(
+        base_url=profile["base_url"],
+        api_key=api_key,
+        timeout=timeout or max(60, int(profile.get("timeout", 180))),
+        max_retries=0,
+    )
 
 
 def chat(profile, messages, json_mode=False, on_delta=None, max_attempts=3):
@@ -29,12 +42,7 @@ def chat(profile, messages, json_mode=False, on_delta=None, max_attempts=3):
     api_key = profile.get("api_key")
     if not api_key:
         raise LLMError(f"模型档案「{profile.get('name')}」未配置 API Key:请在设置页填写,或切换到「离线演示」档案。")
-    client = OpenAI(
-        base_url=profile["base_url"],
-        api_key=api_key,
-        timeout=max(60, int(profile.get("timeout", 180))),
-        max_retries=0,
-    )
+    client = _client(profile)
     last_err = None
     for attempt in range(max_attempts):
         kwargs = dict(
@@ -60,7 +68,12 @@ def chat(profile, messages, json_mode=False, on_delta=None, max_attempts=3):
             last_err = e
             if attempt < max_attempts - 1:
                 time.sleep(1.5 * (attempt + 1))
-    raise LLMError(f"模型调用失败:{last_err}")
+    hint = ""
+    base = str(profile.get("base_url") or "")
+    if ("127.0.0.1" in base or "localhost" in base) and "connect" in str(last_err).lower():
+        hint = ("（本地模型服务未启动？若使用「Gemini 网页版」档案，"
+                "请先运行 python tools/gemini_bridge.py serve）")
+    raise LLMError(f"模型调用失败:{last_err}{hint}")
 
 
 def _collect(client, kwargs, on_delta):
@@ -79,6 +92,48 @@ def _collect(client, kwargs, on_delta):
     if not text:
         raise LLMError("模型返回了空内容")
     return text
+
+
+def list_models(profile):
+    """拉取供应商的模型列表(设置页「获取模型列表」),供下拉选择。"""
+    if is_mock(profile):
+        return ["mock-writer", "mock-fast", "mock-embed"]
+    try:
+        client = _client(profile, timeout=25)
+        data = client.models.list().data
+    except Exception as e:
+        raise LLMError(f"拉取模型列表失败:{e}(部分服务不支持 /models,请手工填写模型名)")
+    ids = sorted({str(m.id) for m in data if getattr(m, "id", None)})
+    if not ids:
+        raise LLMError("服务返回了空模型列表,请手工填写模型名")
+    return ids
+
+
+def embed(profile, texts):
+    """批量向量化(可选向量语义检索用)。mock 模式返回确定性伪向量,保证离线可测。"""
+    texts = [t or " " for t in texts]
+    if is_mock(profile):
+        return [_mock_vec(t) for t in texts]
+    client = _client(profile, timeout=60)
+    resp = client.embeddings.create(
+        model=profile.get("embed_model") or profile.get("model", "text-embedding-3-small"),
+        input=texts,
+    )
+    return [d.embedding for d in resp.data]
+
+
+def _mock_vec(text, dim=64):
+    v = [0.0] * dim
+    s = re.sub(r"\s+", "", text or "")
+    toks = re.findall(r"[a-z0-9]+", s.lower())
+    han = re.sub(r"[^一-鿿]+", " ", s.lower())
+    for seg in han.split():
+        toks += [seg[i:i + 2] for i in range(len(seg) - 1)] or ([seg] if seg else [])
+    for tok in toks:
+        h = int(hashlib.md5(tok.encode("utf-8")).hexdigest(), 16)
+        v[h % dim] += 1.0
+    norm = math.sqrt(sum(x * x for x in v)) or 1.0
+    return [x / norm for x in v]
 
 
 def extract_json(text):

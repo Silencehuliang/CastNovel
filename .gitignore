@@ -14,3 +14,9 @@ venv/
 .vscode/
 *.swp
 .DS_Store
+
+# tools/ 下的任务中间产物
+tools/*.txt
+tools/drafts/
+tools/_fix*.py
+tools/__pycache__/

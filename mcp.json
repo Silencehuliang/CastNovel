@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "castnovel": {
+      "type": "stdio",
+      "command": "E:\\Development\\Env\\Python3.10.11\\python.exe",
+      "args": ["E:/Development/Agents_Project/zcode_project/xiaoshuo/mcp_server.py"],
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      },
+      "description": "CastNovel 铸书 · AI 长篇小说创作工坊（设定 / 大纲 / 章纲 / 正文 / 审校 / 定稿 / 导出）"
+    }
+  }
+}

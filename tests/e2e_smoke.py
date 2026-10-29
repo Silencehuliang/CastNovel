@@ -1,5 +1,8 @@
-"""端到端冒烟测试:mock 模式跑通 设定→角色→大纲→章纲→正文→审校→修订→定稿→导出→导入→用量。
-用法:python tests/e2e_smoke.py [base_url]
+"""端到端冒烟测试:mock 模式跑通 设定→角色→大纲→章纲→正文→审校→修订→定稿→导出→导入→用量,
+以及 v0.3 新特性(Lorebook / 候选重排 / 两步去AI味 / 影响反查 / 级联 / 向量检索 / 供应商预设)。
+用法(务必带 CASTNOVEL_FORCE_MOCK,强制离线、不消耗真实 API 额度):
+  CASTNOVEL_FORCE_MOCK=1 python main.py 8901 &
+  python tests/e2e_smoke.py http://127.0.0.1:8901
 """
 import json
 import sys
@@ -133,6 +136,46 @@ b6 = req("GET", f"/api/projects/{pid}")
 c2b = next(c for c in b6["chapters"] if c["idx"] == 2)
 assert len(c2b["content"] or "") == orig_len, "回滚后内容与快照不一致"
 step("回滚校验", lambda: f"恢复 {len(c2b['content'])} 字")
+
+# ---------- v0.3 新特性 ----------
+
+prov = step("供应商预设", lambda: req("GET", "/api/providers"))
+assert len(prov) >= 10, "内置供应商模板不足"
+
+step("登记Lorebook", lambda: req("POST", f"/api/projects/{pid}/lore",
+                                 {"keywords": "玉佩", "content": "(测试)玉佩在雷雨夜发烫,是身世信物"}))
+ctxl = req("GET", f"/api/projects/{pid}/chapters/{cid}/context")
+assert "Lorebook" in ctxl["context"] and "玉佩在雷雨夜发烫" in ctxl["context"], "Lorebook 未注入上下文"
+step("Lorebook关键词注入", lambda: "已注入")
+
+imp = req("GET", f"/api/projects/{pid}/impact?query=%E7%8E%89%E4%BD%A9")  # 玉佩(URL编码)
+assert imp["affected"], "影响反查未命中(玉佩应出现在正文/章纲)"
+step("影响反查", lambda: f"命中 {len(imp['affected'])} 章")
+
+_, best = step("候选拉样重排(2选1)", lambda: req("POST", f"/api/projects/{pid}/chapters/{c2b['id']}/draft/best", {"n": 2}))
+assert best and best.get("rank") and best["rank"].get("best") in ("甲", "乙"), best
+assert len(best.get("content") or "") > 500
+step("重排结果", lambda: f"候选{best['rank']['best']} 胜出")
+
+_, dr = step("两步去AI味", lambda: req("POST", f"/api/projects/{pid}/chapters/{c2b['id']}/deai"))
+assert "text" in dr and "note" in dr, dr
+
+newch = req("POST", f"/api/projects/{pid}/chapters")
+_, cas = step("级联重生成1章", lambda: req("POST", f"/api/projects/{pid}/cascade",
+                                          {"chapter_ids": [newch["id"]], "include_written": False}))
+assert cas and cas["done"] == 1, cas
+
+st0 = req("GET", "/api/settings")
+profs = st0["settings"]["profiles"]
+step("启用向量检索(mock)", lambda: req("PUT", "/api/settings", {
+    "profiles": profs, "strong_profile": st0["resolved"]["strong"], "fast_profile": st0["resolved"]["fast"],
+    "embedding_profile": st0["resolved"]["strong"], "gen": st0["settings"]["gen"]}))
+ctxv = req("GET", f"/api/projects/{pid}/chapters/{newch['id']}/context")
+assert "相关的旧情节" in ctxv["context"], "向量检索路径未返回旧情节"
+step("向量检索上下文", lambda: f"{ctxv['chars']} 字符")
+req("PUT", "/api/settings", {
+    "profiles": profs, "strong_profile": st0["resolved"]["strong"], "fast_profile": st0["resolved"]["fast"],
+    "embedding_profile": "", "gen": st0["settings"]["gen"]})
 
 usage = step("用量统计", lambda: req("GET", f"/api/projects/{pid}/usage"))
 assert usage["calls"] >= 12

@@ -202,3 +202,56 @@ def state_extract_messages(project, chapter, content, known_chars, open_fores):
         {"role": "system", "content": _sys(project, "只输出 JSON。")},
         {"role": "user", "content": user},
     ]
+
+
+def deai_messages(project, chapter, content, spans):
+    """两步去 AI 味管线第二步:span 级定位清单 + 带例改写方向(arXiv:2409.14509)。"""
+    span_txt = "\n".join(
+        f"{i + 1}. 第{s['line']}行「{s['span']}」→ {s['msg']};改写方向:{s['suggestion']}"
+        for i, s in enumerate(spans)
+    )
+    user = f"""下面的正文经程序化检测,定位出 {len(spans)} 处「AI 味」表达(含行号与原句)。请逐条改写:
+1. 只改这些片段及其前后衔接句,其余部分尽量一字不动,保持总字数不明显缩水;
+2. 每处按给出的「改写方向」重写:用具体动作、五感细节、符合人物的口语替代模板表达;
+3. 情节、信息、人物动机、叙述顺序完全不变;
+4. 直接输出修改后的全文,不要章节号、不要任何解释。
+
+【检测清单】
+{span_txt}
+
+【第 {chapter['idx']} 章《{chapter.get('title', '')}》正文】
+{content}"""
+    return [
+        {"role": "system", "content": _sys(project)},
+        {"role": "user", "content": user},
+    ]
+
+
+def rank_messages(project, chapter, candidates, words):
+    """候选拉样+重排(Re3 的 Sample-Rank 思路):多稿对比,主编选出最优。"""
+    labels = [c["label"] for c in candidates]
+    blocks = []
+    for c in candidates:
+        g = c.get("gate") or {}
+        warns = sum(1 for i in (g.get("issues") or []) if i.get("level") in ("warn", "advisory"))
+        blocks.append(
+            f"━━━ 候选{c['label']} ━━━(字数 {g.get('words', '?')},门禁告警 {warns} 项)\n{c['text'][:4200]}")
+    beats_txt = chapter.get("beats") or "(无)"
+    user = f"""以下是为第 {chapter['idx']} 章《{chapter.get('title', '')}》生成的 {len(candidates)} 个正文候选。请以主编身份逐一评审,选出最适合采用的版本。输出 JSON:
+{{"best": "候选编号之一({'/'.join(labels)})", "scores": {{{', '.join(f'"{lb}": 0-100' for lb in labels)}}}, "reason": "60字内说明选择理由与主要取舍"}}
+
+评判标准:
+1. 节拍完成度:是否覆盖概要与节拍的每个要点,有无遗漏或跑偏;
+2. 人物一致性:言行是否符合档案与当前状态;
+3. 文笔与画面:细节是否具体、有无 AI 味套话;
+4. 结尾钩子是否有力;门禁告警越少越好。
+
+【本章概要】{chapter.get('summary') or '(暂无)'}
+【本章节拍】
+{beats_txt}
+
+{chr(10).join(blocks)}"""
+    return [
+        {"role": "system", "content": _sys(project, "只输出 JSON。")},
+        {"role": "user", "content": user},
+    ]

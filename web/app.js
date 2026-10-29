@@ -110,6 +110,8 @@ async function boot() {
   await refreshProjects();
   $("#btnNew").onclick = openNewProject;
   $("#btnSettings").onclick = openSettings;
+  const mc = $("#btnMockCfg");
+  if (mc) mc.onclick = (e) => { e.preventDefault(); openSettings(); };
   $$("#tabs .tab").forEach(t => t.onclick = () => switchTab(t.dataset.tab));
 }
 
@@ -221,10 +223,12 @@ function switchTab(tab) {
 
 /* ---------------- 设定页 ---------------- */
 
-function renderSetting(view) {
+async function renderSetting(view) {
   const p = curProject();
   const chars = state.bundle.characters;
   const fores = state.bundle.foreshadowing;
+  let lore = [];
+  try { lore = await api(`/projects/${state.pid}/lore`); } catch (e) { /* 忽略,渲染空表 */ }
   view.innerHTML = `
     <div class="card">
       <h3>作品信息 <span class="hint">梗概与文风是所有生成的起点,务必先写好</span></h3>
@@ -253,6 +257,7 @@ function renderSetting(view) {
       <textarea id="f-worldview" rows="10" placeholder="可以自己写,也可以点击「生成世界观」让 AI 依据梗概提案,再手工修改">${esc(p.worldview)}</textarea>
       <div class="stream-box" id="wv-stream"></div>
       <div class="row row-end" style="margin-top:10px;">
+        <button class="btn" id="btnImpact" title="设定改动后,按关键词反查哪些章节提到过它,评估需要回改的范围">🔍 反查受影响章节</button>
         <button class="btn" data-lock id="btnGenWv">✦ 生成世界观</button>
         <button class="btn btn-primary" id="btnSaveWv">保存设定</button>
       </div>
@@ -308,6 +313,27 @@ function renderSetting(view) {
         </tbody>
       </table>
     </div>
+
+    <div class="card">
+      <h3>Lorebook 关键词触发设定 <span class="hint">正文/章纲命中关键词时,该条设定自动注入生成上下文(SillyTavern World Info 机制)</span></h3>
+      <table class="tbl">
+        <thead><tr><th style="width:200px">触发关键词(逗号分隔)</th><th>设定内容(命中即注入)</th><th style="width:70px">启用</th><th style="width:56px"></th></tr></thead>
+        <tbody>
+          ${lore.map(l => `
+            <tr data-lid="${l.id}">
+              <td><input type="text" data-lkeywords value="${esc(l.keywords)}"></td>
+              <td><textarea data-lcontent rows="2">${esc(l.content)}</textarea></td>
+              <td><span class="badge ${l.enabled ? "b-open" : "b-resolved"} data-ltoggle="${l.id}" style="cursor:pointer">${l.enabled ? "启用" : "停用"}</span></td>
+              <td><button class="btn btn-sm btn-danger" data-ldel="${l.id}">删除</button></td>
+            </tr>`).join("") || `<tr><td colspan="4" style="color:var(--ink-soft)">暂无条目。例如:关键词「玉佩」→ 内容「玉佩在雷雨夜会发烫,是身世信物」</td></tr>`}
+        </tbody>
+      </table>
+      <div class="row" style="margin-top:10px;">
+        <input type="text" id="lore-kw" placeholder="关键词,逗号分隔" style="max-width:220px">
+        <input type="text" id="lore-content" placeholder="命中后注入的设定内容" style="flex:1">
+        <button class="btn" id="btnAddLore">＋ 添加条目</button>
+      </div>
+    </div>
   `;
 
   $("#btnSaveInfo").onclick = saveProjectInfo;
@@ -322,6 +348,36 @@ function renderSetting(view) {
     if (!confirm("删除这条情节线?")) return;
     await api(`/projects/${state.pid}/plotlines/${el.dataset.pldel}`, { method: "DELETE" });
     await loadProject(); renderSetting(view);
+  });
+  $("#btnImpact").onclick = () => openImpact();
+  $("#btnAddLore").onclick = async () => {
+    const kw = $("#lore-kw").value.trim(), ct = $("#lore-content").value.trim();
+    if (!kw || !ct) { toast("关键词与内容都要填", true); return; }
+    await api(`/projects/${state.pid}/lore`, { method: "POST", body: JSON.stringify({ keywords: kw, content: ct }) });
+    toast("Lorebook 条目已添加,命中关键词时自动注入");
+    await loadProject(); renderSetting(view);
+  };
+  $$("[data-ltoggle]").forEach(el => el.onclick = async () => {
+    const lid = el.dataset.ltoggle;
+    const enable = el.textContent === "停用";
+    await api(`/projects/${state.pid}/lore/${lid}`, { method: "PUT", body: JSON.stringify({ enabled: enable }) });
+    await loadProject(); renderSetting(view);
+  });
+  $$("[data-ldel]").forEach(el => el.onclick = async () => {
+    if (!confirm("删除该 Lorebook 条目?")) return;
+    await api(`/projects/${state.pid}/lore/${el.dataset.ldel}`, { method: "DELETE" });
+    await loadProject(); renderSetting(view);
+  });
+  $$("[data-lkeywords],[data-lcontent]").forEach(el => {
+    el.addEventListener("input", markDirty);
+    el.addEventListener("blur", async () => {
+      const tr = el.closest("tr");
+      await api(`/projects/${state.pid}/lore/${tr.dataset.lid}`, {
+        method: "PUT",
+        body: JSON.stringify({ keywords: $("[data-lkeywords]", tr).value, content: $("[data-lcontent]", tr).value }),
+      });
+      state.dirty = false;
+    });
   });
   $("#btnGenWv").onclick = async () => {
     await saveProjectInfo(true);
@@ -421,6 +477,37 @@ async function saveProjectInfo(silent) {
   renderProjectList();
 }
 
+/* 设定变更影响分析:按关键词反查受影响章节(确定性扫描,零 token) */
+async function openImpact(defaultKw) {
+  openModal("设定变更影响分析(反查受影响章节)", `
+    <p style="font-size:12.5px;color:var(--ink-soft);margin-bottom:10px;">
+      改了世界观/角色/时间线之后,先反查哪些章节提到过它,再决定回改或级联重生成(写作页/大纲页)。</p>
+    <label class="fld">关键词(角色名、地点、设定词,逗号分隔;扫描标题/概要/章纲/正文)</label>
+    <div class="row">
+      <input type="text" id="imp-q" value="${esc(defaultKw || "")}" placeholder="例如:陆铮, 玉佩" style="flex:1">
+      <button class="btn btn-primary" id="imp-go">反查</button>
+    </div>
+    <div id="imp-result" style="margin-top:12px;"></div>
+  `, close => close(), "关闭");
+  const run = async () => {
+    const kw = $("#imp-q").value.trim();
+    if (!kw) { toast("请输入关键词", true); return; }
+    $("#imp-result").innerHTML = "<p style='color:var(--ink-soft)'>扫描中…</p>";
+    try {
+      const r = await api(`/projects/${state.pid}/impact?query=${encodeURIComponent(kw)}`);
+      const rows = r.affected || [];
+      const stTxt = { planned: "计划", draft: "草稿", reviewed: "已审", final: "定稿" };
+      $("#imp-result").innerHTML = `
+        <p style="font-size:13px;margin-bottom:8px;">命中角色:${(r.characters_matched || []).map(esc).join("、") || "无"};受影响章节 <b>${rows.length}</b> 章。</p>
+        ${rows.length ? `<table class="tbl"><thead><tr><th style="width:46px">#</th><th>标题</th><th style="width:70px">状态</th><th style="width:70px">命中</th><th style="width:150px">分布(标题/概要/章纲/正文)</th></tr></thead>
+        <tbody>${rows.map(x => `<tr><td>${x.idx}</td><td>${esc(x.title)}</td><td>${stTxt[x.status] || x.status}</td><td><b>${x.hits}</b></td><td>${x.n_title}/${x.n_summary}/${x.n_beats}/${x.n_content}</td></tr>`).join("")}</tbody></table>`
+        : `<p style="color:var(--ink-soft)">没有章节命中这些关键词。</p>`}`;
+    } catch (e) { $("#imp-result").innerHTML = `<p style="color:var(--accent)">${esc(e.message)}</p>`; }
+  };
+  $("#imp-go").onclick = run;
+  if (defaultKw) run();
+}
+
 /* ---------------- 大纲页 ---------------- */
 
 function renderOutline(view) {
@@ -434,6 +521,7 @@ function renderOutline(view) {
         <input type="number" id="ol-count" value="30" min="3" max="200" style="width:90px">
         ${chapters.length ? `<label style="font-size:13px"><input type="checkbox" id="ol-replace"> 覆盖现有章节</label>` : ""}
         <span style="flex:1"></span>
+        <button class="btn" id="btnCascade" title="改了某章章纲/设定后,把它之后的受影响章节勾选出来批量重做(章纲→正文→定稿,已有正文自动快照)">⚡ 级联重生成</button>
         <button class="btn" id="btnAddCh">＋ 手动加章</button>
         <button class="btn btn-primary" data-lock id="btnGenOutline">✦ 生成全书大纲</button>
       </div>
@@ -545,6 +633,53 @@ function renderOutline(view) {
     await loadProject();
   }
   bindBeats();
+  $("#btnCascade").onclick = openCascade;
+}
+
+/* 级联重生成:从选中章开始勾选下游章节,批量 章纲→正文→定稿(已有正文自动快照) */
+function openCascade() {
+  const chapters = curChapters();
+  const src = curChapter();
+  if (!src) { toast("请先选中一章作为级联起点", true); return; }
+  const downstream = chapters.filter(c => c.idx >= src.idx);
+  if (!downstream.length) { toast("没有可重做的章节", true); return; }
+  openModal(`级联重生成(从第 ${src.idx} 章起)`, `
+    <p style="font-size:12.5px;color:var(--ink-soft);margin-bottom:10px;">
+      对勾选章节依次执行:章纲 → 正文 → 定稿。已有正文的章重写前自动快照,可在版本历史找回。</p>
+    <div style="max-height:300px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;padding:10px;">
+      ${downstream.map(c => `
+        <label style="display:block;font-size:13px;padding:3px 0;">
+          <input type="checkbox" data-csc value="${c.id}" ${c.content ? "" : "checked"}>
+          第${c.idx}章 ${esc(c.title)} ${c.content ? `· 已写 ${(c.content || "").length} 字` : "· 未写"}
+        </label>`).join("")}
+    </div>
+    <label style="font-size:13px;margin-top:10px;display:block;">
+      <input type="checkbox" id="csc-written"> 包含已有正文的章(把上面未勾选的已写章也一起重做)</label>
+    <div class="statusline" id="csc-log" style="margin-top:8px;white-space:pre-wrap;"></div>
+  `, async close => {
+    const ids = $$("[data-csc]").filter(c => c.checked).map(c => parseInt(c.value, 10));
+    if (!ids.length) { toast("未勾选任何章节", true); return; }
+    const includeWritten = $("#csc-written").checked;
+    close();
+    const log = $("#ol-stream"); log.style.display = "block"; log.textContent = "级联任务启动…";
+    try {
+      const r = await sse(`/projects/${state.pid}/cascade`, { chapter_ids: ids, include_written: includeWritten }, {
+        onEvent: e => {
+          let line = "";
+          if (e.event === "chapter_start") line = `[第${e.idx}章 ${e.title}] 开始…`;
+          else if (e.event === "chapter_skipped") line = `[第${e.idx}章] 跳过:${e.message}`;
+          else if (e.event === "chapter_done") line = `[第${e.idx}章] 完成 ✓`;
+          else if (e.event === "chapter_error") line = `[第${e.idx}章] 失败:${e.message}`;
+          else if (e.event === "aborted") line = `⛔ ${e.message}`;
+          else if (e.event === "batch_done") line = `级联结束:${e.done}/${e.total} 章完成`;
+          if (line) log.textContent = (log.textContent + "\n" + line).split("\n").slice(-14).join("\n");
+        },
+      });
+      toast(`级联重生成完成:${(r && r.done) || 0} 章`);
+    } catch (e) { toast(e.message, true); }
+    log.style.display = "none";
+    await loadProject(); renderOutline($("#view"));
+  }, "开始重生成");
 }
 
 /* ---------------- 写作页 ---------------- */
@@ -587,7 +722,7 @@ function renderWrite(view) {
       </div>
       <div class="statusline" id="batch-log"></div>
       <details class="ctx">
-        <summary>查看本章将注入的上下文(前情 / 角色状态 / 相关旧情节 / 伏笔)</summary>
+        <summary>查看本章将注入的上下文(前情 / 角色状态 / 相关旧情节 / 伏笔 / Lorebook)</summary>
         <pre id="ctx-pre">点击 summary 展开时自动加载…</pre>
       </details>
 
@@ -601,8 +736,12 @@ function renderWrite(view) {
       <textarea id="f-content" rows="18" style="font-size:14.5px;line-height:1.9" placeholder="点击「✦ 生成正文」开始,或直接粘贴/撰写正文">${esc(ch.content)}</textarea>
       <div class="stream-box" id="w-stream"></div>
       <div class="row row-end" style="margin-top:10px;">
+        <label style="font-size:12.5px" title="拉多份候选稿,门禁打分 + 主编重排,择优采用;落选稿存入版本历史">候选
+          <input type="number" id="cand-count" value="1" min="1" max="4" style="width:52px"></label>
         <button class="btn" data-lock id="btnDraft">✦ 生成正文</button>
         <button class="btn" data-lock id="btnPolish" ${ch.content ? "" : "disabled"}>去 AI 味润色</button>
+        <button class="btn" data-lock id="btnDeai" ${ch.content ? "" : "disabled"}
+          title="第一步程序化定位 AI 味片段(零 token),第二步模型按定位清单逐条改写">✦ 两步去 AI 味(span 定位)</button>
         <button class="btn btn-primary" id="btnSaveContent">保存正文</button>
       </div>
       <div class="row" style="margin-top:8px;font-size:12px;color:var(--ink-soft);">
@@ -637,25 +776,42 @@ function renderWrite(view) {
   };
   $("#btnDraft").onclick = async () => {
     if (!confirmDiscard()) return;
-    if ((ch.content || "").trim() && !confirm("本章已有正文,重新生成将覆盖,确定?")) return;
+    if ((ch.content || "").trim() && !confirm("本章已有正文,重新生成将覆盖(旧稿自动快照),确定?")) return;
     await api(`/projects/${state.pid}/chapters/${state.cid}`, {
       method: "PUT", body: JSON.stringify({ summary: $("#f-wsummary").value, beats: $("#f-wbeats").value }),
     });
+    const nCand = parseInt($("#cand-count").value, 10) || 1;
+    const useRank = nCand > 1;
     const ta = $("#f-content"); ta.value = ""; ta.readOnly = true;
     const box = $("#w-stream"); box.style.display = "block";
     try {
-      const saved = await sse(`/projects/${state.pid}/chapters/${state.cid}/draft`, {}, {
-        onDelta: t => { ta.value += t; ta.scrollTop = ta.scrollHeight; $("#w-count").textContent = ta.value.length + " 字"; },
-      });
+      const saved = await sse(
+        useRank ? `/projects/${state.pid}/chapters/${state.cid}/draft/best` : `/projects/${state.pid}/chapters/${state.cid}/draft`,
+        useRank ? { n: nCand } : {},
+        {
+          onDelta: t => {
+            if (useRank) { box.textContent = (box.textContent + t).slice(-600); }
+            else { ta.value += t; ta.scrollTop = ta.scrollHeight; $("#w-count").textContent = ta.value.length + " 字"; }
+          },
+        });
       if (saved) { ch.content = saved.content; ch.status = saved.status; ch.summary = saved.summary; }
       $("#w-status").innerHTML = statusBadge(ch.status);
-      toast(`正文已生成(${(ch.content || "").length} 字)`);
+      if (useRank && saved && saved.rank) {
+        const r = saved.rank;
+        toast(`重排完成:候选${r.best} 胜出${r.reason ? " — " + r.reason : ""}`);
+        box.textContent = `已采用候选${r.best}。各候选评分:${Object.entries(r.scores || {}).map(([k, v]) => k + "=" + v).join("  ") || "(模型未给出)"}\n落选稿已存入版本历史,可随时找回。`;
+      } else {
+        toast(`正文已生成(${(ch.content || "").length} 字)`);
+      }
     } catch (e) { toast(e.message, true); }
     box.style.display = "none"; ta.readOnly = false;
     await loadProject(); renderWrite(view);
   };
   $("#btnPolish").onclick = () => previewOverwrite(
     `/projects/${state.pid}/chapters/${state.cid}/polish`, "#w-stream", "润色稿(去 AI 味)", view);
+  $("#btnDeai").onclick = () => previewOverwrite(
+    `/projects/${state.pid}/chapters/${state.cid}/deai`, "#w-stream", "两步去 AI 味(span 定位改写)", view, null,
+    r => { if (r && r.note) toast(r.note); });
   $("#btnSaveContent").onclick = async () => {
     await api(`/projects/${state.pid}/chapters/${state.cid}`, {
       method: "PUT", body: JSON.stringify({ content: $("#f-content").value }),
@@ -806,8 +962,8 @@ function renderReviewResult(r) {
   `;
 }
 
-/* 润色/修订:先流式预览,再由作者决定是否采用 */
-async function previewOverwrite(url, streamSel, title, view, areaSel) {
+/* 润色/修订/两步去AI味:先流式预览,再由作者决定是否采用 */
+async function previewOverwrite(url, streamSel, title, view, areaSel, onDone) {
   const area = areaSel ? $(areaSel) : $("#revise-area");
   if (!area) return;
   if (!confirmDiscard()) return;
@@ -824,8 +980,9 @@ async function previewOverwrite(url, streamSel, title, view, areaSel) {
   const box = $(streamSel);
   if (box) { box.style.display = "block"; box.textContent = "生成中…"; }
   let text = "";
+  let result = null;
   try {
-    await sse(url, {}, {
+    result = await sse(url, {}, {
       onDelta: t => {
         text += t;
         pv.value = text;
@@ -841,6 +998,10 @@ async function previewOverwrite(url, streamSel, title, view, areaSel) {
     if (box) box.style.display = "none";
     return;
   }
+  if (onDone && result) onDone(result, box);
+  // 生成接口返回结构化结果(如两步去AI味的 text/spans/note):用干净的最终文本覆盖流式拼接,
+  // 避免过程状态行(如「[检测] 命中 N 处…」)混进预览稿被采用
+  if (result && typeof result.text === "string") { pv.value = result.text; text = result.text; }
   $("#pv-adopt").onclick = async () => {
     await api(`/projects/${state.pid}/chapters/${state.cid}/adopt`, {
       method: "POST", body: JSON.stringify({ content: pv.value, note: title }),
@@ -917,22 +1078,34 @@ async function renderExport(view) {
 function openSettings() {
   const s = state.settings;
   const gen = s.gen || {};
+  let providers = [];
+  api("/providers").then(list => { providers = list || []; fillPresetSelect(); }).catch(() => {});
   openModal("设置 · 模型档案", `
     <p style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;">
-      任何 OpenAI 兼容接口均可(DeepSeek / 智谱 / 通义 / Kimi / OpenAI / Ollama…)。
-      「强模型」负责大纲与正文等创意任务,「快模型」负责摘要与状态抽取 —— 分档计费,显著省钱。
-      base_url 填 <code>mock://local</code> 即为离线演示模式。
-    </p>
+      任何 OpenAI 兼容接口均可。从模板添加可一键填好 Base URL 与默认模型,只需再粘贴 API Key;
+      不知道模型名时点「拉取模型」直接从服务拉列表。「强模型」负责大纲与正文等创意任务,「快模型」负责摘要与状态抽取。
+      base_url 填 <code>mock://local</code> 即为离线演示模式。</p>
+    <div class="row" style="margin-bottom:12px;">
+      <select id="s-preset" style="max-width:280px"><option value="">— 从服务商模板添加 —</option></select>
+      <button class="btn btn-sm" id="btnAddFromPreset">＋ 用模板添加档案</button>
+      <span style="flex:1"></span>
+      <button class="btn btn-sm" id="btnAddProfile">＋ 空白档案</button>
+    </div>
     <div id="profiles">
       ${(s.profiles || []).map((p, i) => profileRow(p, i)).join("")}
     </div>
-    <button class="btn btn-sm" id="btnAddProfile">＋ 添加档案</button>
-    <div class="grid2" style="margin-top:16px;">
+    <datalist id="dl-models"></datalist>
+    <div class="grid3" style="margin-top:16px;">
       <div><label class="fld">强模型档案(大纲/正文/审校)</label>
         <select id="s-strong">${(s.profiles || []).map(p => `<option ${p.name === s.strong_profile ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select></div>
       <div><label class="fld">快模型档案(摘要/状态抽取)</label>
         <select id="s-fast">${(s.profiles || []).map(p => `<option ${p.name === s.fast_profile ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select></div>
+      <div><label class="fld">Embedding 档案(可选,向量语义检索)</label>
+        <select id="s-embed"><option value="">(不启用,用关键词 BM25)</option>
+          ${(s.profiles || []).map(p => `<option ${p.name === s.embedding_profile ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select></div>
     </div>
+    <p style="font-size:12px;color:var(--ink-soft);margin-top:4px;">
+      Embedding 档案需服务支持 /embeddings(如 OpenAI、硅基流动、智谱);启用后旧情节检索升级为向量余弦,异常自动回退 BM25。</p>
     <h3 style="margin-top:16px;font-size:14px;">生成参数</h3>
     <div class="grid2">
       <div><label class="fld">每章目标字数</label><input type="number" id="s-words" value="${gen.chapter_words || 3000}"></div>
@@ -962,6 +1135,7 @@ function openSettings() {
         profiles,
         strong_profile: profiles.some(p => p.name === strong) ? strong : profiles[0].name,
         fast_profile: profiles.some(p => p.name === fast) ? fast : profiles[profiles.length - 1].name,
+        embedding_profile: profiles.some(p => p.name === $("#s-embed").value) ? $("#s-embed").value : "",
         gen: {
           chapter_words: parseInt($("#s-words").value, 10) || 3000,
           context_chars: parseInt($("#s-ctx").value, 10) || 14000,
@@ -975,11 +1149,26 @@ function openSettings() {
     toast("设置已保存");
   }, "保存设置");
 
-  $("#btnAddProfile").onclick = () => {
+  const fillPresetSelect = () => {
+    const sel = $("#s-preset");
+    if (!sel) return;
+    sel.innerHTML = `<option value="">— 从服务商模板添加 —</option>` +
+      providers.map((p, i) => `<option value="${i}">${esc(p.label)}</option>`).join("");
+  };
+  const addProfileRow = (p) => {
     const div = document.createElement("div");
-    div.innerHTML = profileRow({ name: "", base_url: "", api_key: "", model: "", temperature: 0.8, max_tokens: 8192 }, Date.now());
+    div.innerHTML = profileRow(p, Date.now());
     $("#profiles").appendChild(div.firstElementChild);
     bindProfileRows();
+  };
+  $("#btnAddProfile").onclick = () => addProfileRow({ name: "", base_url: "", api_key: "", model: "", temperature: 0.8, max_tokens: 8192 });
+  $("#btnAddFromPreset").onclick = () => {
+    const p = providers[parseInt($("#s-preset").value, 10)];
+    if (!p) { toast("请先选择一个服务商模板", true); return; }
+    addProfileRow({
+      name: p.label, base_url: p.base_url, api_key: "", model: p.model || "",
+      temperature: 0.8, max_tokens: 8192, _preset_note: p.note ? `${p.note}${p.key_url ? " · 取 Key: " + p.key_url : ""}` : "",
+    });
   };
   bindProfileRows();
 }
@@ -989,22 +1178,41 @@ function profileRow(p, i) {
     <div class="grid4">
       <div><label class="fld">档案名</label><input type="text" data-pname value="${esc(p.name)}" placeholder="主力"></div>
       <div><label class="fld">Base URL</label><input type="text" data-purl value="${esc(p.base_url)}" placeholder="https://api.deepseek.com/v1"></div>
-      <div><label class="fld">模型</label><input type="text" data-pmodel value="${esc(p.model)}" placeholder="deepseek-chat"></div>
-      <div><label class="fld">API Key</label><input type="password" data-pkey value="${esc(p.api_key)}" placeholder="sk-…"></div>
+      <div><label class="fld">模型</label><input type="text" data-pmodel list="dl-models" value="${esc(p.model)}" placeholder="deepseek-chat"></div>
+      <div><label class="fld">API Key</label><input type="password" data-pkey value="${esc(p.api_key)}" placeholder="sk-…(本地服务可留空)"></div>
     </div>
     <div class="grid3">
       <div><label class="fld">温度</label><input type="number" step="0.05" data-ptemp value="${p.temperature ?? 0.8}"></div>
       <div><label class="fld">max_tokens</label><input type="number" data-pmt value="${p.max_tokens ?? 8192}"></div>
       <div style="display:flex;align-items:flex-end;gap:8px;padding-bottom:2px;">
+        <button class="btn btn-sm" data-pmodels title="从该服务拉取可用模型列表,点击下方模型输入框即可选择">拉取模型</button>
         <button class="btn btn-sm" data-ptest>测试</button>
         <button class="btn btn-sm btn-danger" data-pdel>删除</button>
       </div>
     </div>
-    <div class="statusline" data-pstatus></div>
+    <div class="statusline" data-pstatus>${esc(p._preset_note || "")}</div>
   </div>`;
 }
 
 function bindProfileRows() {
+  $$("[data-pmodels]").forEach(b => b.onclick = async () => {
+    const row = b.closest(".profile-row");
+    const st = $("[data-pstatus]", row);
+    st.textContent = "拉取模型列表中…";
+    try {
+      const r = await api("/llm/models", {
+        method: "POST",
+        body: JSON.stringify({
+          base_url: $("[data-purl]", row).value.trim(),
+          api_key: $("[data-pkey]", row).value.trim(),
+        }),
+      });
+      if (!r.ok) { st.textContent = "✗ " + r.error; return; }
+      const dl = $("#dl-models");
+      dl.innerHTML = r.models.map(m => `<option value="${esc(m)}">`).join("");
+      st.textContent = `✓ 共 ${r.models.length} 个模型:点击右侧「模型」输入框查看下拉列表`;
+    } catch (e) { st.textContent = "✗ " + e.message; }
+  });
   $$("[data-ptest]").forEach(b => b.onclick = async () => {
     const row = b.closest(".profile-row");
     const st = $("[data-pstatus]", row);
@@ -1020,7 +1228,7 @@ function bindProfileRows() {
         temperature: parseFloat($("[data-ptemp]", r).value) || 0.8,
         max_tokens: parseInt($("[data-pmt]", r).value, 10) || 8192,
       }));
-      await api("/settings", { method: "PUT", body: JSON.stringify({ profiles, strong_profile: name, fast_profile: name, gen: state.settings.gen }) });
+      await api("/settings", { method: "PUT", body: JSON.stringify({ profiles, strong_profile: name, fast_profile: name, embedding_profile: state.settings.embedding_profile || "", gen: state.settings.gen }) });
       await refreshSettings();
       const r = await api("/llm/test", { method: "POST", body: JSON.stringify({ name }) });
       st.textContent = r.ok ? `✓ 连接成功:${r.reply}` : `✗ ${r.error}`;

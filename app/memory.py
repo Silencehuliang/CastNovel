@@ -1,11 +1,11 @@
 """三层记忆系统:为每章生成组装「结构化上下文」。
 
-1. 静态层:世界观、文风、角色档案(故事圣经);
+1. 静态层:世界观、文风、角色档案(故事圣经);另有 Lorebook:按关键词命中注入的设定条目;
 2. 序列层:全书各章摘要(滚动压缩)+ 上一章结尾原文(口吻衔接);
-3. 检索层:对旧章摘要做字符二元组 BM25 检索,把与本章最相关的旧情节拉回上下文;
-   另附「待回收伏笔」清单,供正文呼应。
+3. 检索层:对旧章摘要做字符二元组 BM25 检索(或配置 embedding 档案后走向量余弦),
+   把与本章最相关的旧情节拉回上下文;另附「待回收伏笔」清单,供正文呼应。
 
-全部中文友好、零外部依赖(不强制 embedding API)。
+BM25 中文友好、零外部依赖;向量检索为可选增强,任何异常自动降级回 BM25。
 """
 import math
 import re
@@ -51,8 +51,43 @@ def _clip(text, limit):
     return text if len(text) <= limit else text[:limit] + "…"
 
 
-def build_context(project, characters, chapters, foreshadowing, target_idx, settings):
-    """组装写第 target_idx 章时所需的上下文文本。"""
+def cosine(a, b):
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a)) or 1.0
+    nb = math.sqrt(sum(x * x for x in b)) or 1.0
+    return dot / (na * nb)
+
+
+def hit_lore(lore, *texts, max_entries=8, entry_limit=400):
+    """Lorebook 命中:关键词(逗号/顿号/空格分隔)出现在任一给定文本中即注入。"""
+    blob = "\n".join(t or "" for t in texts)
+    if not blob.strip():
+        return []
+    hits = []
+    for e in lore or []:
+        if not e.get("enabled"):
+            continue
+        kws = [k.strip() for k in re.split(r"[,，、;；\s]+", e.get("keywords") or "") if k.strip()]
+        matched = [k for k in kws if k in blob]
+        if matched:
+            hits.append((e, matched))
+        if len(hits) >= max_entries:
+            break
+    lines = []
+    for e, matched in hits:
+        lines.append(f"- [{ '、'.join(matched[:3]) }] {_clip(e.get('content'), entry_limit)}")
+    return lines
+
+
+def build_context(project, characters, chapters, foreshadowing, target_idx, settings,
+                  lore=None, query_vec=None, doc_vectors=None):
+    """组装写第 target_idx 章时所需的上下文文本。
+
+    lore: Lorebook 条目(关键词命中注入);
+    query_vec/doc_vectors: 可选向量语义检索(为空时自动用 BM25)。
+    """
     gen = settings.get("gen", {})
     world_limit = 2200
     char_limit = 280
@@ -105,7 +140,7 @@ def build_context(project, characters, chapters, foreshadowing, target_idx, sett
         tail = _clip(last["content"][-1400:], 1400)
         parts.append("【上一章结尾(衔接口吻,勿复述)】\n" + tail)
 
-    # 检索层:旧章摘要 + 开头片段
+    # 检索层:旧章摘要 + 开头片段(向量可用则余弦相似,否则 BM25)
     if query and prev:
         docs = []
         for ch in prev:
@@ -114,7 +149,14 @@ def build_context(project, characters, chapters, foreshadowing, target_idx, sett
                 "text": f"第{ch['idx']}章《{ch.get('title', '')}》 {(ch.get('summary') or '')} {(ch.get('content') or '')[:400]}",
             })
         topk = int(gen.get("retrieval_topk", 3))
-        ids = set(topk_chunks(query, docs, k=topk))
+        dvecs = doc_vectors or {}
+        if query_vec and dvecs:
+            usable = [d for d in docs if d["id"] in dvecs]
+            scored = sorted(((cosine(query_vec, dvecs[d["id"]]), d) for d in usable),
+                            key=lambda x: -x[0])
+            ids = {d["id"] for s, d in scored[:topk] if s > 0.01}
+        else:
+            ids = set(topk_chunks(query, docs, k=topk))
         hits = [d for d in docs if d["id"] in ids and d["id"] != (last or {}).get("idx")]
         if hits:
             lines = []
@@ -124,6 +166,12 @@ def build_context(project, characters, chapters, foreshadowing, target_idx, sett
                 frag = _clip((ch.get("summary") or (ch.get("content") or "")[:300]), 300)
                 lines.append(f"第{ch.get('idx')}章《{ch.get('title', '')}》:{frag}")
             parts.append("【与本章相关的旧情节(避免重复、注意呼应)】\n" + "\n".join(lines))
+
+    # Lorebook:关键词命中的设定条目(优先级高于检索,直接注入)
+    lore_lines = hit_lore(lore, beats_txt, *(ch.get("summary") or "" for ch in prev[-3:]),
+                          (last or {}).get("content", "")[-2000:])
+    if lore_lines:
+        parts.append("【设定注入(Lorebook 关键词命中,必须遵守)】\n" + "\n".join(lore_lines))
 
     open_fs = [f for f in (foreshadowing or []) if f.get("status") == "open"]
     if open_fs:

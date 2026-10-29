@@ -8,10 +8,10 @@ import json
 import re
 
 from app import db, prompts
-from app.config import load_settings, resolve_profile
-from app.llm import chat, extract_json
+from app.config import find_profile, load_settings, resolve_profile
+from app.llm import chat, embed, extract_json
 from app.memory import build_context
-from app.lint import lint_text
+from app.lint import lint_spans, lint_text
 
 
 def _load(pid):
@@ -81,8 +81,37 @@ def _ctx_parts(pid, target_idx, settings):
     characters = db.list_characters(pid)
     chapters = db.list_chapters(pid)
     fores = db.list_foreshadowing(pid)
-    context = build_context(project, characters, chapters, fores, target_idx, settings)
+    lore = db.list_lore(pid, only_enabled=True)
+    qvec, dvecs = _vector_aux(pid, chapters, target_idx, settings)
+    context = build_context(project, characters, chapters, fores, target_idx, settings,
+                            lore=lore, query_vec=qvec, doc_vectors=dvecs)
     return project, characters, chapters, context
+
+
+def _vector_aux(pid, chapters, target_idx, settings):
+    """可选向量语义检索:返回 (查询向量, {旧章idx: 向量});未配置或任何异常 → (None, None) 降级 BM25。"""
+    name = settings.get("embedding_profile") or ""
+    if not name:
+        return None, None
+    prof = find_profile(settings, name)
+    if not prof:
+        return None, None
+    tag = f"{prof.get('base_url', '')}#{prof.get('embed_model') or prof.get('model', '')}"
+    try:
+        prevs = [ch for ch in chapters if ch["idx"] < target_idx and (ch.get("summary") or ch.get("content"))]
+        cache = db.list_embeddings(pid, tag)
+        missing = [ch for ch in prevs if ch["idx"] not in cache]
+        if missing:
+            texts = [(ch.get("summary") or (ch.get("content") or "")[:600]) for ch in missing]
+            for ch, vec in zip(missing, embed(prof, texts)):
+                db.save_embedding(pid, ch["idx"], tag, vec)
+                cache[ch["idx"]] = vec
+        target = next((ch for ch in chapters if ch["idx"] == target_idx), {})
+        qtext = " ".join(x for x in [target.get("beats") or "", target.get("summary") or ""] if x)
+        qvec = embed(prof, [qtext or " "])[0] if qtext else None
+        return qvec, cache
+    except Exception:
+        return None, None  # embedding 服务不可用:静默降级 BM25,不阻塞写作主流程
 
 
 def gen_worldview(pid, on_delta=None):
@@ -194,6 +223,144 @@ def gen_draft(pid, cid, on_delta=None):
     db.touch_project(pid)
     db.add_log(pid, "draft", f"第{chapter['idx']}章 {len(text)}字")
     return {**db.get_chapter(cid), "_gate": gate}
+
+
+def gen_draft_best(pid, cid, n=2, on_delta=None):
+    """候选拉样+重排(Re3 的 Sample-Rank 思路):拉 n 份候选 → 门禁打分 → 强模型主编重排 → 择优采用。
+
+    落选候选全部存入版本历史(非正典分支,可随时回滚取用),正典候选写入章节。
+    """
+    def say(msg):
+        if on_delta:
+            on_delta(msg)
+
+    n = max(2, min(int(n or 2), 4))
+    settings = load_settings(db)
+    chapter = db.get_chapter(cid)
+    if not chapter:
+        raise ValueError("章节不存在")
+    if (chapter.get("content") or "").strip():
+        db.add_version(cid, f"第{chapter['idx']}章候选重排前自动保存")
+    project, characters, chapters, context = _ctx_parts(pid, chapter["idx"], settings)
+    words = int(settings.get("gen", {}).get("chapter_words", 3000))
+    beats = [ln.strip() for ln in (chapter.get("beats") or "").splitlines()
+             if ln.strip() and not ln.strip().startswith("章末钩子")]
+    messages = prompts.draft_messages(project, chapter, beats, context, words)
+    profile = resolve_profile(settings, "strong")
+    cands = []
+    for lb in ["甲", "乙", "丙", "丁"][:n]:
+        say(f"[候选{lb}] 生成中…\n")
+        text = _chat(pid, "draft", profile, messages)
+        gate = run_gate(settings, project, chapters, characters, {**chapter, "content": text})
+        warns = sum(1 for it in gate["issues"] if it.get("level") in ("warn", "advisory"))
+        cands.append({"label": lb, "text": text, "gate": gate, "warns": warns})
+        say(f"[候选{lb}] 完成 {len(text)} 字,门禁告警 {warns} 项\n")
+    say("[重排] 主编评审候选中…\n")
+    try:
+        rank = extract_json(_chat(pid, "rank", profile,
+                                  prompts.rank_messages(project, chapter, cands, words), json_mode=True))
+    except Exception:
+        rank = {}
+    by_label = {c["label"]: c for c in cands}
+    best_label = rank.get("best")
+    if best_label not in by_label:  # 模型没按规矩回答:门禁告警最少者优先
+        best_label = min(cands, key=lambda c: c["warns"])["label"]
+    best = by_label[best_label]
+    scores = rank.get("scores") if isinstance(rank.get("scores"), dict) else {}
+    for c in cands:
+        if c["label"] == best_label:
+            continue
+        score = scores.get(c["label"])
+        db.add_version_text(cid, c["text"], f"落选候选{c['label']}" + (f"(评分{score})" if score is not None else ""))
+    gate = run_gate(settings, project, chapters, characters, {**chapter, "content": best["text"]})
+    db.update_chapter(cid, {"content": best["text"], "status": "draft",
+                            "gate": json.dumps(gate, ensure_ascii=False)})
+    db.touch_project(pid)
+    db.add_log(pid, "draft_best", f"第{chapter['idx']}章 {len(cands)} 选 1 → 候选{best_label}({len(best['text'])}字)")
+    return {**db.get_chapter(cid), "_gate": gate,
+            "_rank": {"best": best_label, "scores": scores, "reason": str(rank.get("reason", "")),
+                      "labels": [c["label"] for c in cands]}}
+
+
+def deai_rewrite(pid, cid, on_delta=None):
+    """两步去 AI 味管线:第一步程序化 span 级检测(零 token),第二步模型按定位清单带例改写。
+
+    返回新稿不落库,由前端预览确认后采用(与润色同样的人为主编原则)。
+    """
+    settings = load_settings(db)
+    chapter = db.get_chapter(cid)
+    if not chapter or not (chapter.get("content") or "").strip():
+        raise ValueError("本章还没有正文,请先生成或粘贴正文。")
+    spans = lint_spans(chapter["content"])
+    if not spans:
+        return {"text": chapter["content"], "spans": [], "note": "程序化检测未发现 AI 味命中,无需改写。"}
+    project = _load(pid)
+    if on_delta:
+        on_delta(f"[检测] 命中 {len(spans)} 处,已逐条定位,模型改写中…\n")
+    text = _chat(pid, "deai", resolve_profile(settings, "strong"),
+                 prompts.deai_messages(project, chapter, chapter["content"], spans), on_delta=on_delta)
+    remain = len(lint_spans(text))
+    return {"text": text, "spans": spans,
+            "note": f"改写前命中 {len(spans)} 处,改写后复检剩余 {remain} 处。"}
+
+
+def find_impact(pid, query):
+    """设定变更影响分析(天命式反查):按关键词确定性扫描,列出受影响的章节。零 token。"""
+    kws = [k.strip() for k in re.split(r"[,，、;；\s]+", query or "") if k.strip()]
+    if not kws:
+        raise ValueError("请提供要反查的关键词(角色名、地点、设定词,逗号分隔)")
+    rows = []
+    for ch in db.list_chapters(pid):
+        fields = {"title": ch.get("title") or "", "summary": ch.get("summary") or "",
+                  "beats": ch.get("beats") or "", "content": ch.get("content") or ""}
+        counts = {f: sum(fields[f].count(k) for k in kws) for f in fields}
+        total = sum(counts.values())
+        if total:
+            rows.append({"idx": ch["idx"], "id": ch["id"], "title": ch.get("title", ""),
+                         "status": ch.get("status", ""), "hits": total,
+                         "n_title": counts["title"], "n_summary": counts["summary"],
+                         "n_beats": counts["beats"], "n_content": counts["content"]})
+    chars = [c["name"] for c in db.list_characters(pid) if any(k in c["name"] or c["name"] in k for k in kws)]
+    return {"keywords": kws, "characters_matched": chars, "affected": rows}
+
+
+def cascade_regenerate(pid, chapter_ids, include_written=False, on_event=None):
+    """级联重生成:对选定章节依次 章纲 → 正文 → 定稿;已有正文的章自动快照,不丢稿。
+
+    典型用途:改了某章章纲或某项设定后,把反查出的受影响下游章节勾选进来批量重做。
+    """
+    def ev(data):
+        if on_event:
+            on_event(data)
+
+    ids = sorted({int(c) for c in (chapter_ids or [])})
+    if not ids:
+        raise ValueError("未选择任何要重做的章节")
+    done, fails = 0, 0
+    for cid in ids:
+        ch = db.get_chapter(cid)
+        if not ch or ch["project_id"] != pid:
+            ev({"event": "chapter_error", "idx": cid, "message": "章节不存在"})
+            continue
+        ev({"event": "chapter_start", "idx": ch["idx"], "title": ch.get("title") or ""})
+        try:
+            if (ch.get("content") or "").strip() and not include_written:
+                ev({"event": "chapter_skipped", "idx": ch["idx"], "message": "已有正文,未勾选「包含已写章节」"})
+                continue
+            gen_beats(pid, cid)
+            gen_draft(pid, cid)
+            finalize_chapter(pid, cid)
+            done += 1
+            fails = 0
+            ev({"event": "chapter_done", "idx": ch["idx"], "cid": cid})
+        except Exception as e:
+            fails += 1
+            ev({"event": "chapter_error", "idx": ch["idx"], "message": str(e)})
+            if fails >= 2:
+                ev({"event": "aborted", "done": done, "message": "连续 2 章失败,级联任务中止(避免空烧 API)"})
+                break
+    ev({"event": "batch_done", "done": done, "total": len(ids)})
+    return {"done": done, "total": len(ids)}
 
 
 def adopt_content(pid, cid, content, note=""):
