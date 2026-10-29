@@ -776,6 +776,7 @@ function renderWrite(view) {
       <div class="statusline" id="batch-log"></div>
       <details class="ctx">
         <summary>查看本章将注入的上下文(前情 / 角色状态 / 相关旧情节 / 伏笔 / Lorebook)</summary>
+        <div id="ctx-budget" style="font-size:12px;color:var(--ink-soft);padding:6px 8px;margin:6px 0;background:rgba(127,127,127,.08);border-radius:6px;"></div>
         <pre id="ctx-pre">点击 summary 展开时自动加载…</pre>
       </details>
 
@@ -816,6 +817,19 @@ function renderWrite(view) {
         const r = await api(`/projects/${state.pid}/chapters/${state.cid}/context`);
         $("#ctx-pre").textContent = r.context;
         $("#ctx-pre").dataset.loaded = "1";
+        const b = r.budget || {};
+        const budgetEl = $("#ctx-budget");
+        if (b.layers) {
+          const parts = b.layers.filter(l => l.used > 0)
+            .map(l => `${l.label} ${l.used}/${l.quota}`).join(" · ");
+          budgetEl.textContent = `预算 ${b.budget} 字 · 已用 ${b.used} 字 · 剩余 ${b.remaining} 字 · ${parts}`
+            + (b.dropped_total ? ` · 裁掉 ${b.dropped_total} 条` : "");
+          budgetEl.title = b.layers.filter(l => l.dropped_count)
+            .map(l => `${l.label} 裁掉 ${l.dropped_count} 条:${(l.dropped || []).join("、")}`).join("\n");
+        } else {
+          budgetEl.textContent = "";
+          budgetEl.title = "";
+        }
       } catch (e) { $("#ctx-pre").textContent = "加载失败:" + e.message; }
     }
   });

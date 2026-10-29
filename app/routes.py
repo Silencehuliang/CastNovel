@@ -337,8 +337,12 @@ def get_context(pid: int, cid: int):
     if not chapter:
         raise HTTPException(status_code=404, detail="章节不存在")
     settings = load_settings(db)
-    ctx = stages._ctx_parts(pid, chapter["idx"], settings)[3]
-    return {"context": ctx, "chars": len(ctx)}
+    bundle = stages._ctx_bundle(pid, chapter["idx"], settings)
+    return {
+        "context": bundle["context"],
+        "chars": len(bundle["context"]),
+        "budget": bundle["report"],
+    }
 
 
 @router.put("/projects/{pid}/chapters/{cid}")

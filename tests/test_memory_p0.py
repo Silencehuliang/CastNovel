@@ -18,6 +18,7 @@ os.environ["CASTNOVEL_FORCE_MOCK"] = "1"
 sys.path.insert(0, ".")
 
 from app import db, stages
+from app.memory import build_context_report
 
 
 def check(cond, msg):
@@ -132,6 +133,61 @@ def test_validation_and_status_guard():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_budget_report():
+    tmp = fresh_db()
+    try:
+        project = {
+            "title": "预算测试", "premise": "玉佩与暗门", "genre": "悬疑",
+            "worldview": "世界观设定。" * 500, "style": "简洁克制。" * 100,
+        }
+        characters = [
+            {"name": f"角色{i}", "role": "配角", "profile": "人物设定。" * 100, "status": f"状态{i}"}
+            for i in range(12)
+        ]
+        chapters = [
+            {"idx": i, "title": f"第{i}章", "summary": "章节摘要。玉佩与暗门。" * 60,
+             "content": "正文。" * 300, "beats": ""}
+            for i in range(1, 21)
+        ]
+        chapters.append({"idx": 21, "title": "第21章", "summary": "", "content": "", "beats": "玉佩 暗门"})
+        fores = [{"title": f"伏笔{i}", "description": "线索。" * 40, "status": "open"} for i in range(20)]
+        reader = [
+            {"kind": ["known", "expect", "mislead"][i % 3], "content": f"读者认知{i}。" * 10,
+             "status": "open", "chapter_idx": i}
+            for i in range(24)
+        ]
+        lore = [
+            {"id": 1, "keywords": "玉佩", "content": "玉佩是身世信物。" * 50, "enabled": 1,
+             "constant": 0, "priority": 10, "secondary": "", "logic": "and_any"},
+            {"id": 2, "keywords": "", "content": "常驻设定。" * 20, "enabled": 1,
+             "constant": 1, "priority": 0, "secondary": "", "logic": "and_any"},
+        ]
+        settings = {"gen": {"context_chars": 2000, "summary_window": 6, "retrieval_topk": 3}}
+        text, report = build_context_report(
+            project, characters, chapters, fores, 21, settings,
+            lore=lore, reader=reader, char_states=[],
+        )
+        check(len(text) <= 2000, f"上下文超预算:{len(text)}")
+        check(report["budget"] == 2000, "报告预算错误")
+        check(report["used"] == len(text), "报告已用字符与实际不一致")
+        check(report["dropped_total"] > 0, "小预算应产生被裁条目")
+        check(any(l["dropped_count"] for l in report["layers"]), "应记录被裁条目的层")
+        check(any(l["key"] == "lore" and l["kept"] >= 1 for l in report["layers"]), "常驻 Lorebook 应保留")
+
+        big, big_report = build_context_report(
+            project, characters, chapters, fores, 21,
+            {"gen": {"context_chars": 14000, "summary_window": 6, "retrieval_topk": 3}},
+            lore=lore, reader=reader, char_states=[],
+        )
+        for marker in ("世界观", "主要角色档案", "前情脉络", "上一章结尾",
+                       "相关的旧情节", "Lorebook", "待回收伏笔", "读者认知状态"):
+            check(marker in big, f"默认预算缺少层:{marker}")
+        check(big_report["used"] == len(big), "默认预算报告已用字符不一致")
+        check(big_report["budget"] == 14000, "默认预算值错误")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_finalize_mock_and_reject():
     tmp = fresh_db()
     try:
@@ -190,6 +246,8 @@ def main():
     print("[OK] 事务提交/回滚 + memory_events")
     test_validation_and_status_guard()
     print("[OK] 状态校验/去重/死亡回退/旧章守卫")
+    test_budget_report()
+    print("[OK] context_chars 预算分配与报告")
     test_finalize_mock_and_reject()
     print("[OK] mock 定稿全链路 + 校验失败不落库")
     print("\nP0 memory tests passed")

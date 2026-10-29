@@ -10,7 +10,7 @@ import re
 from app import db, prompts
 from app.config import find_profile, load_settings, resolve_profile
 from app.llm import chat, embed, extract_json
-from app.memory import build_context
+from app.memory import build_context_report
 from app.lint import lint_spans, lint_text
 
 
@@ -160,17 +160,29 @@ def run_gate(settings, project, chapters, characters, chapter):
     }
 
 
-def _ctx_parts(pid, target_idx, settings):
+def _ctx_bundle(pid, target_idx, settings):
     project = _load(pid)
     characters = db.list_characters(pid)
     chapters = db.list_chapters(pid)
     fores = db.list_foreshadowing(pid)
     lore = db.list_lore(pid, only_enabled=True)
     reader = db.list_reader(pid)
+    char_states = db.list_character_states(pid)
     qvec, dvecs = _vector_aux(pid, chapters, target_idx, settings)
-    context = build_context(project, characters, chapters, fores, target_idx, settings,
-                            lore=lore, query_vec=qvec, doc_vectors=dvecs, reader=reader)
-    return project, characters, chapters, context
+    context, report = build_context_report(
+        project, characters, chapters, fores, target_idx, settings,
+        lore=lore, query_vec=qvec, doc_vectors=dvecs, reader=reader,
+        char_states=char_states,
+    )
+    return {
+        "project": project, "characters": characters, "chapters": chapters,
+        "context": context, "report": report,
+    }
+
+
+def _ctx_parts(pid, target_idx, settings):
+    bundle = _ctx_bundle(pid, target_idx, settings)
+    return bundle["project"], bundle["characters"], bundle["chapters"], bundle["context"]
 
 
 def _vector_aux(pid, chapters, target_idx, settings):

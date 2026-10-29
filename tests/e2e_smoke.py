@@ -8,6 +8,13 @@ import json
 import sys
 import urllib.request
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8901"
 
 
@@ -88,6 +95,9 @@ step("门禁检查", lambda: f"{gate['words']}/{gate['target']}字, 人物命中
 
 ctx = step("上下文预览", lambda: req("GET", f"/api/projects/{pid}/chapters/{cid}/context"))
 assert "世界观" in ctx["context"] or "写作要求" in ctx["context"]
+assert ctx.get("budget") and ctx["budget"]["budget"] > 0, "上下文预算报告缺失"
+assert ctx["budget"]["used"] == len(ctx["context"]) <= ctx["budget"]["budget"], "上下文预算超限"
+assert any(l["key"] == "characters" for l in ctx["budget"]["layers"]), "预算报告缺少分层明细"
 
 _, review = step("审校第1章", lambda: req("POST", f"/api/projects/{pid}/chapters/{cid}/review"))
 assert review and "overall" in review, review
@@ -100,11 +110,16 @@ step("采用修订稿", lambda: req("PUT", f"/api/projects/{pid}/chapters/{cid}"
 _, fin = step("定稿(摘要+状态)", lambda: req("POST", f"/api/projects/{pid}/chapters/{cid}/finalize"))
 assert fin and fin.get("summary")
 assert "bundle" in fin
+assert fin.get("validation", {}).get("errors") == [], "定稿状态校验不应报错"
 b4 = fin["bundle"]
 assert b4["chapters"][0]["status"] == "final"
 step("摘要长度", lambda: len(fin["summary"]))
 step("人物状态更新数", lambda: len(fin["state"].get("characters", [])))
 step("伏笔事件数", lambda: len(fin["state"].get("foreshadowing", [])))
+events = step("记忆变更日志", lambda: req("GET", f"/api/projects/{pid}/memory-events"))
+assert events and any(e["entity"] == "chapter" for e in events), "记忆变更日志缺少定稿事件"
+assert any(e["entity"] in ("character", "character_state") for e in events), "记忆变更日志缺少人物事件"
+assert events[0].get("after") is not None, "记忆变更日志缺少 after 快照"
 
 # 第2章的上下文应包含第1章摘要
 c1 = b4["chapters"][1]["id"]
